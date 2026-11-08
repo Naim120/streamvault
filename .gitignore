@@ -1,0 +1,98 @@
+# ==============================================================================
+# STREAMVAULT .gitignore
+# ==============================================================================
+
+# 1. Environment & Confidential Credentials
+.env
+.env.*
+*.env
+!.env.example
+
+# 2. Binaries & Executables
+cloudflared
+*.bin
+*.exe
+*.dll
+*.so
+*.dylib
+.bin/
+
+# 3. Python Virtualenvs & Caches
+venv/
+.venv/
+env/
+ENV/
+backend/venv/
+backend/.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# 4. Node & Frontend Build Artifacts
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.npm
+.yarn/
+*.tsbuildinfo
+
+# 5. Media Files & Storage Directories
+# Keep directory structure via .gitkeep but ignore all video/audio/transcode payload
+media/*
+!media/incoming/
+!media/incoming/.gitkeep
+!media/library/
+!media/library/.gitkeep
+!media/temp/
+!media/temp/.gitkeep
+media/incoming/*
+!media/incoming/.gitkeep
+media/library/*
+!media/library/.gitkeep
+media/temp/*
+!media/temp/.gitkeep
+
+# Catch-all for media extensions anywhere
+*.mkv
+*.mp4
+*.ts
+*.m4s
+*.m3u8
+*.vtt
+*.srt
+*.ass
+*.ssa
+*.webm
+*.avi
+*.mov
+downloads/
+
+# 6. Runtime Logs & State
+logs/*
+!logs/.gitkeep
+*.log
+.streamvault_state
+.nginx/
+
+# 7. IDE, Editor & OS Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# 8. Antigravity & Agent Caches
+.antigravity/
+.gemini/

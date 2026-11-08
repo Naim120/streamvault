@@ -1,0 +1,450 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# STREAMVAULT — PRODUCTION RUNTIME CONTROLLER & SERVICE SUPERVISOR v2.6
+# Lifecycle, Reboot Auto-Start, State Persistence & Cloudflare Named Tunnel
+# Usage:
+#   ./start.sh              (Defaults to dev or last active mode)
+#   ./start.sh prod         (Production mode: Nginx Gateway :8080 + API + Admin + Named Tunnel)
+#   ./start.sh dev          (Development mode: Vite :5173 + API :8000 + Admin :4000)
+#   ./start.sh tunnel       (Production Gateway + Named or Quick Cloudflare Tunnel)
+#   ./start.sh start        (Resumes last active state/mode)
+#   ./start.sh stop         (Gracefully stops services & sets STOPPED_BY_ADMIN)
+#   ./start.sh stop-from-systemd (Gracefully stops services on system reboot without state change)
+#   ./start.sh boot         (Called by systemd on reboot; respects STOPPED_BY_ADMIN)
+#   ./start.sh restart      (Restarts active services in current/last mode)
+#   ./start.sh status       (Displays live PID, port status, and boot auto-start state)
+#   ./start.sh autostart on|off (Enables or disables systemd boot auto-start)
+# ==============================================================================
+
+set -e
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
+export PATH="$HOME/.local/bin:$PATH"
+
+# Formatting Colors
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+RED='\033[0;31m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Persistent State File
+STATE_FILE="$DIR/.streamvault_state"
+DESIRED_STATE="ACTIVE"
+LAST_MODE="prod"
+
+if [ -f "$STATE_FILE" ]; then
+  # shellcheck disable=SC1090
+  . "$STATE_FILE" 2>/dev/null || true
+fi
+
+# Load .env variables
+if [ -f "$DIR/.env" ]; then
+  chmod 600 "$DIR/.env" 2>/dev/null || true
+  set -a
+  # shellcheck disable=SC1090
+  . "$DIR/.env"
+  set +a
+fi
+
+# Privilege Helper for systemd
+SUDO=""
+if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+fi
+
+# Detect Python Uvicorn runner
+detect_uvicorn() {
+  if [ -f "$DIR/.venv/bin/uvicorn" ]; then
+    echo "$DIR/.venv/bin/uvicorn"
+  elif [ -f "$DIR/backend/venv/bin/uvicorn" ]; then
+    echo "$DIR/backend/venv/bin/uvicorn"
+  elif command -v uvicorn >/dev/null 2>&1; then
+    command -v uvicorn
+  else
+    echo "python3 -m uvicorn"
+  fi
+}
+UVICORN="$(detect_uvicorn)"
+
+save_state() {
+  cat > "$STATE_FILE" <<EOF
+DESIRED_STATE="${DESIRED_STATE}"
+LAST_MODE="${LAST_MODE}"
+EOF
+}
+
+# ==============================================================================
+# SUB-COMMAND: STATUS
+# ==============================================================================
+show_status() {
+  echo -e "${BOLD}===========================================================${NC}"
+  echo -e "${BOLD}  STREAMVAULT SYSTEM & SERVICE STATUS                      ${NC}"
+  echo -e "${BOLD}===========================================================${NC}"
+  echo -e "  • Project Directory:    ${CYAN}${DIR}${NC}"
+  echo -e "  • Desired State:        $([ "$DESIRED_STATE" = "ACTIVE" ] && echo -e "${GREEN}${BOLD}ACTIVE${NC}" || echo -e "${RED}${BOLD}STOPPED_BY_ADMIN${NC}")"
+  echo -e "  • Last Configured Mode: ${BOLD}${LAST_MODE}${NC}"
+
+  # Boot auto-start check
+  local autostart_status="Disabled"
+  if command -v systemctl >/dev/null 2>&1 && [ -f /etc/systemd/system/streamvault.service ]; then
+    if systemctl is-enabled streamvault.service >/dev/null 2>&1; then
+      autostart_status="Enabled (systemd: streamvault.service)"
+    else
+      autostart_status="Disabled (systemd: installed but not enabled)"
+    fi
+  fi
+  echo -e "  • Boot Auto-Start:      ${BOLD}${autostart_status}${NC}"
+  echo ""
+  echo -e "${BOLD}Live Component Breakdown:${NC}"
+
+  # 1. FastAPI Media Server (:8000)
+  local api_pid
+  api_pid="$(lsof -ti :8000 2>/dev/null | head -n1 || pgrep -f "uvicorn app.main:app" | head -n1 || true)"
+  if [ -n "$api_pid" ]; then
+    echo -e "  • FastAPI Media Server   [Port 8000] : ${GREEN}● RUNNING${NC} (PID: ${api_pid})"
+  else
+    echo -e "  • FastAPI Media Server   [Port 8000] : ${RED}○ STOPPED${NC}"
+  fi
+
+  # 2. Local Admin Panel (:4000)
+  local admin_pid
+  admin_pid="$(lsof -ti :4000 2>/dev/null | head -n1 || pgrep -f "admin-local.server:app" | head -n1 || true)"
+  if [ -n "$admin_pid" ]; then
+    echo -e "  • Local Admin Panel      [Port 4000] : ${GREEN}● RUNNING${NC} (PID: ${admin_pid})"
+  else
+    echo -e "  • Local Admin Panel      [Port 4000] : ${RED}○ STOPPED${NC}"
+  fi
+
+  # 3. Nginx Single-Origin Gateway (:8080)
+  local nginx_pid
+  nginx_pid="$(lsof -ti :8080 2>/dev/null | head -n1 || true)"
+  if [ -n "$nginx_pid" ]; then
+    echo -e "  • Nginx Single-Origin    [Port 8080] : ${GREEN}● RUNNING${NC} (PID: ${nginx_pid})"
+  else
+    echo -e "  • Nginx Single-Origin    [Port 8080] : ${RED}○ STOPPED${NC}"
+  fi
+
+  # 4. Aria2c RPC Daemon (:6800)
+  local aria2_pid
+  aria2_pid="$(lsof -ti :6800 2>/dev/null | head -n1 || pgrep -x "aria2c" | head -n1 || true)"
+  if [ -n "$aria2_pid" ]; then
+    echo -e "  • Aria2c Download Daemon [Port 6800] : ${GREEN}● RUNNING${NC} (PID: ${aria2_pid})"
+  else
+    echo -e "  • Aria2c Download Daemon [Port 6800] : ${RED}○ STOPPED${NC}"
+  fi
+
+  # 5. Cloudflare Tunnel
+  local cf_pid
+  cf_pid="$(pgrep -f "cloudflared.*tunnel" | head -n1 || true)"
+  if [ -n "$cf_pid" ]; then
+    if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
+      echo -e "  • Cloudflare Named Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> https://${PUBLIC_DOMAIN})"
+    else
+      echo -e "  • Cloudflare Quick Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid})"
+    fi
+  else
+    echo -e "  • Cloudflare Tunnel                  : ${RED}○ STOPPED${NC}"
+  fi
+
+  # 6. Vite Dev Server (:5173)
+  local vite_pid
+  vite_pid="$(lsof -ti :5173 2>/dev/null | head -n1 || true)"
+  if [ -n "$vite_pid" ]; then
+    echo -e "  • Vite Dev Server        [Port 5173] : ${GREEN}● RUNNING${NC} (PID: ${vite_pid})"
+  fi
+
+  echo -e "${BOLD}===========================================================${NC}"
+  exit 0
+}
+
+# ==============================================================================
+# SUB-COMMAND: STOPPING SERVICES
+# ==============================================================================
+stop_all_services() {
+  echo -e "${YELLOW}Stopping StreamVault services...${NC}"
+  pkill -f "uvicorn app.main:app" 2>/dev/null || true
+  pkill -f "admin-local.server:app" 2>/dev/null || true
+  pkill -f "streamvault-api" 2>/dev/null || true
+  pkill -f "streamvault-admin" 2>/dev/null || true
+  pkill -f "vite" 2>/dev/null || true
+  pkill -f "cloudflared.*tunnel" 2>/dev/null || true
+  pkill -x "aria2c" 2>/dev/null || true
+
+  if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
+    nginx -c "$DIR/nginx.conf" -s quit 2>/dev/null || true
+  fi
+  rm -f "$DIR/.nginx/nginx.pid" 2>/dev/null || true
+}
+
+# ==============================================================================
+# SUB-COMMAND: AUTOSTART (systemd on/off)
+# ==============================================================================
+configure_autostart() {
+  local action="$1"
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo -e "${RED}[✗] systemd (systemctl) is not available on this operating system.${NC}"
+    exit 1
+  fi
+
+  if [ "$action" = "on" ]; then
+    echo -e "${CYAN}Configuring systemd auto-start service (/etc/systemd/system/streamvault.service)...${NC}"
+    local current_user
+    current_user="$(whoami)"
+
+    cat <<EOF | $SUDO tee /etc/systemd/system/streamvault.service >/dev/null
+[Unit]
+Description=StreamVault Production Media Streaming Platform
+After=network-online.target nginx.service
+Wants=network-online.target
+
+[Service]
+Type=forking
+User=${current_user}
+WorkingDirectory=${DIR}
+ExecStart=${DIR}/start.sh boot
+ExecStop=${DIR}/start.sh stop-from-systemd
+RemainAfterExit=yes
+TimeoutStartSec=120
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable streamvault.service
+    echo -e "${GREEN}[ ✓ ] StreamVault boot auto-start ENABLED via systemd.${NC}"
+  elif [ "$action" = "off" ]; then
+    echo -e "${YELLOW}Disabling systemd auto-start for StreamVault...${NC}"
+    if [ -f /etc/systemd/system/streamvault.service ]; then
+      $SUDO systemctl disable streamvault.service 2>/dev/null || true
+      $SUDO rm -f /etc/systemd/system/streamvault.service
+      $SUDO systemctl daemon-reload
+    fi
+    echo -e "${GREEN}[ ✓ ] StreamVault boot auto-start DISABLED.${NC}"
+  else
+    echo "Usage: ./start.sh autostart [on|off]"
+    exit 1
+  fi
+  exit 0
+}
+
+# Parse Command Mode
+MODE="${1:-}"
+
+case "$MODE" in
+  status)
+    show_status
+    ;;
+  stop)
+    stop_all_services
+    DESIRED_STATE="STOPPED_BY_ADMIN"
+    save_state
+    echo -e "${GREEN}[ ✓ ] StreamVault stopped successfully.${NC}"
+    echo -e "${YELLOW}Note: Because you stopped the app manually, it will remain stopped across server reboots until you run './start.sh start' or './start.sh prod'.${NC}"
+    exit 0
+    ;;
+  stop-from-systemd)
+    stop_all_services
+    echo -e "${GREEN}[ ✓ ] StreamVault cleanly stopped by systemd shutdown.${NC}"
+    exit 0
+    ;;
+  autostart)
+    configure_autostart "$2"
+    ;;
+  restart)
+    stop_all_services
+    sleep 1
+    MODE="${LAST_MODE:-prod}"
+    DESIRED_STATE="ACTIVE"
+    save_state
+    ;;
+  start)
+    MODE="${LAST_MODE:-prod}"
+    DESIRED_STATE="ACTIVE"
+    save_state
+    ;;
+  boot)
+    if [ "$DESIRED_STATE" = "STOPPED_BY_ADMIN" ]; then
+      echo "[INFO] StreamVault was manually stopped by admin prior to reboot. Respecting stopped state and skipping auto-start."
+      exit 0
+    fi
+    MODE="${LAST_MODE:-prod}"
+    ;;
+  prod|tunnel|dev|"")
+    MODE="${MODE:-${LAST_MODE:-dev}}"
+    DESIRED_STATE="ACTIVE"
+    LAST_MODE="$MODE"
+    save_state
+    ;;
+  *)
+    echo "Usage: ./start.sh [prod|dev|tunnel|start|stop|restart|status|autostart on/off]"
+    exit 1
+    ;;
+esac
+
+echo "==========================================================="
+echo "  Starting StreamVault (Mode: ${MODE^^})                   "
+echo "==========================================================="
+
+mkdir -p "$DIR/media/incoming" "$DIR/media/library" "$DIR/media/temp" "$DIR/.nginx" "$DIR/logs" "$HOME/.aria2"
+
+# 1. Aria2c Daemon
+if ! pgrep -x "aria2c" > /dev/null; then
+  echo "[1/4] Starting aria2c background daemon on port 6800..."
+  if [ -z "$ARIA2_RPC_SECRET" ] || [ "$ARIA2_RPC_SECRET" = "aria2_rpc_supersecret_token_123456" ]; then
+    ARIA2_SECRET=$(openssl rand -hex 24 2>/dev/null || python3 -c "import secrets; print(secrets.token_hex(24))")
+  else
+    ARIA2_SECRET="$ARIA2_RPC_SECRET"
+  fi
+  cat << EOF > "$HOME/.aria2/aria2.conf"
+dir=${DIR}/media/incoming
+enable-rpc=true
+rpc-listen-all=false
+rpc-listen-port=6800
+rpc-secret=${ARIA2_SECRET}
+rpc-allow-origin-all=false
+max-connection-per-server=16
+min-split-size=10M
+split=16
+max-concurrent-downloads=3
+seed-time=0
+bt-save-metadata=true
+EOF
+  chmod 600 "$HOME/.aria2/aria2.conf"
+  aria2c --conf-path="$HOME/.aria2/aria2.conf" -D || echo "aria2 already active..."
+else
+  echo "[1/4] aria2c daemon is already active."
+fi
+
+# 2. FastAPI Media Server (Port 8000)
+echo "[2/4] Starting FastAPI Media Server on port 8000..."
+cd "$DIR/backend"
+API_HOST="127.0.0.1"
+if [ "$1" = "boot" ]; then
+  setsid nohup "$UVICORN" app.main:app --host "$API_HOST" --port 8000 < /dev/null >> "$DIR/logs/media_server.log" 2>&1 &
+else
+  "$UVICORN" app.main:app --host "$API_HOST" --port 8000 >> "$DIR/logs/media_server.log" 2>&1 &
+fi
+MEDIA_PID=$!
+
+# 3. Local Admin Panel (Port 4000)
+echo "[3/4] Starting Local Admin Panel on 127.0.0.1:4000..."
+cd "$DIR"
+
+# Ensure Admin Panel static Tailwind stylesheet is compiled
+if [ -f "$DIR/frontend/node_modules/.bin/tailwindcss" ] && [ -f "$DIR/admin-local/tailwind.input.css" ]; then
+  mkdir -p "$DIR/admin-local/static"
+  if [ ! -f "$DIR/admin-local/static/tailwind.min.css" ] || [ "$DIR/admin-local/server.py" -nt "$DIR/admin-local/static/tailwind.min.css" ]; then
+    echo "Compiling Admin Panel static Tailwind stylesheet..."
+    NODE_OPTIONS="--max-old-space-size=256" "$DIR/frontend/node_modules/.bin/tailwindcss" -i "$DIR/admin-local/tailwind.input.css" -o "$DIR/admin-local/static/tailwind.min.css" --minify > /dev/null 2>&1 || true
+  fi
+fi
+
+if [ "$1" = "boot" ]; then
+  setsid nohup "$UVICORN" admin-local.server:app --host 127.0.0.1 --port 4000 < /dev/null >> "$DIR/logs/admin.log" 2>&1 &
+else
+  "$UVICORN" admin-local.server:app --host 127.0.0.1 --port 4000 >> "$DIR/logs/admin.log" 2>&1 &
+fi
+ADMIN_PID=$!
+
+# 4. Web Tier (Prod Nginx vs Dev Vite)
+if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
+  echo "[4/4] Ensuring production frontend is built..."
+  if [ ! -d "$DIR/frontend/dist" ] || [ ! -f "$DIR/frontend/dist/index.html" ]; then
+    cd "$DIR/frontend"
+    npm run build
+  fi
+
+  echo "Starting Nginx single-origin gateway on port 8080..."
+  if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
+    nginx -c "$DIR/nginx.conf" -s reload
+  else
+    nginx -c "$DIR/nginx.conf"
+  fi
+
+  # Check for authenticated Named Tunnel from install.sh
+  HAS_NAMED_TUNNEL="false"
+  if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
+    HAS_NAMED_TUNNEL="true"
+  fi
+
+  if [ "$MODE" = "tunnel" ] || [ "$HAS_NAMED_TUNNEL" = "true" ]; then
+    if [ "$HAS_NAMED_TUNNEL" = "true" ]; then
+      echo "Starting Authenticated Cloudflare Named Tunnel (https://${PUBLIC_DOMAIN})..."
+      pkill -f "cloudflared.*tunnel.*run" 2>/dev/null || true
+      cloudflared --config "$HOME/.cloudflared/config.yml" tunnel run > "$DIR/logs/cloudflared.log" 2>&1 &
+      TUNNEL_PID=$!
+    elif [ "$MODE" = "tunnel" ]; then
+      echo "Starting Cloudflare Quick Tunnel to Nginx Gateway (http://127.0.0.1:8080)..."
+      if command -v cloudflared >/dev/null 2>&1; then
+        cloudflared tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
+        TUNNEL_PID=$!
+      elif [ -f "$DIR/cloudflared" ]; then
+        "$DIR/cloudflared" tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
+        TUNNEL_PID=$!
+      fi
+    fi
+  fi
+
+  LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0 2>/dev/null || echo '127.0.0.1')"
+
+  # Automatically synchronize Supabase Auth site_url and uri_allow_list to reachable origin
+  TARGET_ORIGIN="http://${LAN_IP}:8080"
+  if [ "$HAS_NAMED_TUNNEL" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then
+    TARGET_ORIGIN="https://${PUBLIC_DOMAIN}"
+  fi
+  SB_TOKEN="${SUPABASE_MANAGEMENT_TOKEN:-}"
+  SB_REF="${SUPABASE_PROJECT_REF:-}"
+  if [ -n "$SB_TOKEN" ] && [ -n "$SB_REF" ]; then
+    curl -s -X PATCH "https://api.supabase.com/v1/projects/${SB_REF}/config/auth" \
+      -H "Authorization: Bearer ${SB_TOKEN}" \
+      -H "Content-Type: application/json" \
+      -d "{\"site_url\":\"${TARGET_ORIGIN}\",\"uri_allow_list\":\"http://localhost:8080/**,http://localhost:5173/**,http://${LAN_IP}:8080/**,http://${LAN_IP}/**,http://192.168.*.*:8080/**,http://192.168.*.*/**,http://10.*.*.*:8080/**,http://10.*.*.*/**,http://172.*.*.*:8080/**,http://172.*.*.*/**,https://*.trycloudflare.com/**\"}" >/dev/null 2>&1 || true
+  fi
+
+  echo ""
+  echo "==========================================================="
+  echo "  StreamVault PRODUCTION GATEWAY is LIVE!                 "
+  if [ "$HAS_NAMED_TUNNEL" = "true" ]; then
+    echo "  • Public Custom Domain:  https://${PUBLIC_DOMAIN}        "
+  fi
+  echo "  • Nginx Gateway (Local): http://localhost:8080           "
+  echo "  • Nginx Gateway (LAN):   http://${LAN_IP}:8080           "
+  echo "  • Local Admin Panel:     http://127.0.0.1:4000           "
+  echo "==========================================================="
+else
+  echo "[4/4] Starting Vite React Frontend with /api proxy on http://localhost:5173..."
+  cd "$DIR/frontend"
+  npm run dev &
+  FRONTEND_PID=$!
+
+  echo ""
+  echo "==========================================================="
+  echo "  StreamVault DEV ENVIRONMENT is LIVE!                    "
+  echo "  • Public Web App:        http://localhost:5173           "
+  echo "  • Media Server API:      http://localhost:8000/docs      "
+  echo "  • Local Admin Panel:     http://127.0.0.1:4000           "
+  echo "==========================================================="
+fi
+
+# If boot command from systemd, disown background jobs and exit 0 so forking service succeeds
+if [ "$1" = "boot" ]; then
+  disown -a 2>/dev/null || true
+  echo "StreamVault background startup sequence complete."
+  exit 0
+fi
+
+echo "Press Ctrl+C to terminate services (or run './start.sh stop' from another terminal)."
+
+cleanup() {
+  echo "Terminating services..."
+  kill $MEDIA_PID $ADMIN_PID ${FRONTEND_PID:-} ${TUNNEL_PID:-} 2>/dev/null || true
+  if [ -f "$DIR/.nginx/nginx.pid" ]; then
+    nginx -c "$DIR/nginx.conf" -s quit 2>/dev/null || true
+  fi
+  exit 0
+}
+
+trap cleanup INT TERM
+wait

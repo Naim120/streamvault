@@ -1,0 +1,7 @@
+User-agent: *
+Allow: /
+Allow: /legal/
+Disallow: /api/
+Disallow: /home
+Sitemap: /sitemap.xml
+

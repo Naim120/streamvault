@@ -1,0 +1,20 @@
+# Media & HLS outputs (CRITICAL: prevents .ts video segments from being indexed as TypeScript!)
+media/
+**/media/
+*.ts.bak
+*.m4s
+*.m3u8
+*.aac
+*.mkv
+*.mp4
+*.vtt
+
+# Dependencies & Build Artifacts
+node_modules/
+**/node_modules/
+.venv/
+venv/
+__pycache__/
+dist/
+build/
+.git/

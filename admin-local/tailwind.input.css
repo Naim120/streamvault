@@ -1,0 +1,3 @@
+@import "../frontend/node_modules/tailwindcss" source(none);
+@source "./server.py";
+@source "./modules/*.py";
