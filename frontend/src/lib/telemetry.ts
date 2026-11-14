@@ -10,6 +10,7 @@ export interface DualStackIPs {
   ipv6: string | null;
 }
 
+const STORAGE_KEY_IPS = 'streamvault_dual_stack_ips';
 const STORAGE_KEY_SESSION_ID = 'streamvault_telemetry_session_id';
 
 /**
