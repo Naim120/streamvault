@@ -604,20 +604,29 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
 
           if [ -n "$CF_ACCOUNT_ID" ] && [ -n "$CF_API_TOKEN" ]; then
             info "Verifying & provisioning project '${CF_PAGES_NAME}' in your Cloudflare account..."
-            local cf_resp
             cf_resp="$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "{\"name\":\"${CF_PAGES_NAME}\",\"production_branch\":\"main\"}" 2>/dev/null || true)"
 
-            local cf_success
             cf_success="$(echo "$cf_resp" | grep -o '"success":true' || true)"
             if [ -n "$cf_success" ]; then
-              success "Cloudflare Pages project '${CF_PAGES_NAME}' created in your account!"
+              cf_subdomain="$(echo "$cf_resp" | grep -oE '"subdomain":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
+              [ -n "$cf_subdomain" ] && PUBLIC_DOMAIN="$cf_subdomain" || PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+              success "Cloudflare Pages project '${CF_PAGES_NAME}' created in your account (${PUBLIC_DOMAIN})!"
               break
             else
-              local cf_err
-              cf_err="$(echo "$cf_resp" | grep -oE '"message":"[^"]+"' | head -n1 || echo "$cf_resp")"
+              # Check if project already exists in this account
+              cf_existing="$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PAGES_NAME}" \
+                -H "Authorization: Bearer ${CF_API_TOKEN}" 2>/dev/null || true)"
+              if echo "$cf_existing" | grep -q '"success":true'; then
+                cf_subdomain="$(echo "$cf_existing" | grep -oE '"subdomain":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
+                [ -n "$cf_subdomain" ] && PUBLIC_DOMAIN="$cf_subdomain" || PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+                success "Found existing Cloudflare Pages project '${CF_PAGES_NAME}' in your account (${PUBLIC_DOMAIN})!"
+                break
+              fi
+
+              cf_err="$(echo "$cf_resp" | grep -oE '"message":"[^"]+"' | head -n1 | cut -d'"' -f4 || echo "$cf_resp")"
               warn "Cloudflare API response: $cf_err"
               echo "Would you like to try another name, or switch to instant Cloudflare Quick Tunnel?"
               echo "  1) Try another project name"
@@ -631,12 +640,13 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
           else
             warn "No API token provided. StreamVault cannot verify or create this project on Cloudflare."
             echo "You must manually create project '${CF_PAGES_NAME}' in your Cloudflare dashboard."
+            PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
             break
           fi
         done
 
         if [ "$FREE_CF_METHOD" = "2" ]; then
-          PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+          [ -z "$PUBLIC_DOMAIN" ] && PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
           FRONTEND_ORIGIN="https://${PUBLIC_DOMAIN}"
           CF_PAGES_PROJECT="$CF_PAGES_NAME"
           save_answer "PUBLIC_DOMAIN" "$PUBLIC_DOMAIN"
