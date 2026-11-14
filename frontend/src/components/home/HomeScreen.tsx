@@ -9,6 +9,7 @@ import { ContinueWatchingRow } from './ContinueWatchingRow';
 import { MediaRow } from './MediaRow';
 import { PosterCard } from './PosterCard';
 import { Footer } from '../layout/Footer';
+import { prevalidateTrailer } from '../../lib/trailerValidator';
 
 export const HomeScreen: React.FC = () => {
   const { user } = useAuthStore();
@@ -87,6 +88,26 @@ export const HomeScreen: React.FC = () => {
   const featuredItem = rawFeatured && allMedia
     ? (allMedia.find(m => m.id === rawFeatured.id) || rawFeatured)
     : rawFeatured;
+
+  // Pre-validate trailers in the background for billboard item and initial visible rail items
+  useEffect(() => {
+    if (featuredItem?.trailer_youtube_key) {
+      prevalidateTrailer(featuredItem.trailer_youtube_key);
+    }
+    const candidates = [
+      ...(feedData?.recently_added || []).slice(0, 8),
+      ...(feedData?.most_watched || []).slice(0, 8),
+      ...(feedData?.most_liked || []).slice(0, 8),
+      ...(feedData?.critics_picks || []).slice(0, 8)
+    ];
+    candidates.forEach((item, idx) => {
+      if (item.trailer_youtube_key) {
+        setTimeout(() => {
+          prevalidateTrailer(item.trailer_youtube_key);
+        }, idx * 100);
+      }
+    });
+  }, [featuredItem?.id, featuredItem?.trailer_youtube_key, feedData]);
 
   // Helper for genre filtering
   const getGenreItems = (keyword: string) => {

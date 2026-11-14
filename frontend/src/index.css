@@ -112,12 +112,18 @@
 }
 
 /* Form inputs & textareas must never show TV outline, glow, or scale transform */
+input,
 input:focus,
 input:focus-visible,
+input:active,
+textarea,
 textarea:focus,
 textarea:focus-visible,
+textarea:active,
+select,
 select:focus,
-select:focus-visible {
+select:focus-visible,
+select:active {
   outline: none !important;
   outline-offset: 0 !important;
   box-shadow: none !important;

@@ -8,6 +8,12 @@ import { supabase } from '../../lib/supabase';
 import { MediaImage } from '../common/MediaImage';
 import { extractSafeTrailer } from '../../lib/security';
 import { prewarmStream } from '../../lib/streamPrewarm';
+import {
+  isTrailerBlocked,
+  isTrailerPlayable,
+  markTrailerBlocked,
+  markTrailerPlayable
+} from '../../lib/trailerValidator';
 
 interface BillboardProps {
   item: MediaItem;
@@ -21,8 +27,12 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
 
   const [muted, setMuted] = useState(true);
   const [isPlaying, setIsPlaying] = useState(true);
+  const [liveTrailerKey, setLiveTrailerKey] = useState<string | null>(item?.trailer_youtube_key || null);
+  const trailer = extractSafeTrailer(item?.trailer_youtube_key || liveTrailerKey);
+
   const [isVideoReady, setIsVideoReady] = useState(false);
-  const [trailerError, setTrailerError] = useState(false);
+  const [trailerError, setTrailerError] = useState(() => isTrailerBlocked(trailer?.src));
+  const [trailerVerifiedPlayable, setTrailerVerifiedPlayable] = useState(() => isTrailerPlayable(trailer?.src));
   const [isInView, setIsInView] = useState(true);
   const [isSynopsisExpanded, setIsSynopsisExpanded] = useState(false);
   const [localResume, setLocalResume] = useState<WatchProgressItem | null>(resumeProgress || null);
@@ -31,6 +41,9 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
   const billboardContainerRef = useRef<HTMLDivElement | null>(null);
   const iframeRef = useRef<HTMLIFrameElement | null>(null);
   const videoRef = useRef<HTMLVideoElement | null>(null);
+  const lastPlayerStateRef = useRef<number | null>(null);
+  const readyCheckTimerRef = useRef<number | null>(null);
+  const fallbackWatchdogRef = useRef<number | null>(null);
 
   useEffect(() => {
     if (resumeProgress !== undefined) {
@@ -103,15 +116,25 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
 
   if (!item) return null;
 
-  const [liveTrailerKey, setLiveTrailerKey] = useState<string | null>(item?.trailer_youtube_key || null);
-
   useEffect(() => {
     let isMounted = true;
     // Immediately synchronize liveTrailerKey with the current item (resets to null if item has no trailer!)
     const initialKey = item?.trailer_youtube_key ? item.trailer_youtube_key.trim() : null;
     setLiveTrailerKey(initialKey || null);
-    setTrailerError(false);
+
+    const activeTrailer = extractSafeTrailer(initialKey);
+    setTrailerError(isTrailerBlocked(activeTrailer?.src));
+    setTrailerVerifiedPlayable(isTrailerPlayable(activeTrailer?.src));
     setIsVideoReady(false);
+    lastPlayerStateRef.current = null;
+    if (readyCheckTimerRef.current) {
+      clearTimeout(readyCheckTimerRef.current);
+      readyCheckTimerRef.current = null;
+    }
+    if (fallbackWatchdogRef.current) {
+      clearTimeout(fallbackWatchdogRef.current);
+      fallbackWatchdogRef.current = null;
+    }
 
     if (!initialKey && item?.id) {
       supabase
@@ -123,6 +146,9 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
           if (!isMounted) return;
           const dbKey = data?.trailer_youtube_key ? data.trailer_youtube_key.trim() : null;
           setLiveTrailerKey(dbKey || null);
+          const fetchedTrailer = extractSafeTrailer(dbKey);
+          setTrailerError(isTrailerBlocked(fetchedTrailer?.src));
+          setTrailerVerifiedPlayable(isTrailerPlayable(fetchedTrailer?.src));
         });
     }
     return () => {
@@ -130,7 +156,23 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
     };
   }, [item?.id, item?.trailer_youtube_key]);
 
-  const trailer = extractSafeTrailer(item?.trailer_youtube_key || liveTrailerKey);
+  // Listen for broadcast trailer status changes across the app
+  useEffect(() => {
+    const handleStatusChange = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && detail.src === trailer?.src) {
+        if (detail.status === 'blocked') {
+          setTrailerError(true);
+          setIsVideoReady(false);
+          setTrailerVerifiedPlayable(false);
+        } else if (detail.status === 'playable') {
+          setTrailerVerifiedPlayable(true);
+        }
+      }
+    };
+    window.addEventListener('sv:trailer-status', handleStatusChange);
+    return () => window.removeEventListener('sv:trailer-status', handleStatusChange);
+  }, [trailer?.src]);
 
   // Re-sync Billboard visibility and layout when returning from DetailModal or VideoPlayer
   useEffect(() => {
@@ -149,18 +191,45 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
       try {
         const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
         if (data && typeof data === 'object') {
-          // If a genuine error code occurs from YouTube player, fallback to backdrop poster
+          // 1. If a genuine error code occurs from YouTube player, fallback to backdrop poster
           if (
             data.event === 'onError' ||
             data.event === 'onPlayerError' ||
             (data.info && (data.info.error || [2, 5, 100, 101, 150].includes(data.info)))
           ) {
+            markTrailerBlocked(trailer?.src);
             setTrailerError(true);
             setIsVideoReady(false);
+            setTrailerVerifiedPlayable(false);
             return;
           }
 
-          // When onReady arrives, trigger playback and mute handshake, but do NOT reveal iframe yet
+          // 2. Instant bot-check & unplayable video detection in initialDelivery / infoDelivery (<150ms)
+          const vd = data.info?.videoData;
+          if (vd) {
+            const isExplicitlyUnplayable = vd.isPlayable === false;
+            const hasErrorCode = Boolean(vd.errorCode);
+            const isBlankTitle =
+              (data.event === 'initialDelivery' || data.event === 'infoDelivery') &&
+              typeof vd.title === 'string' &&
+              vd.title.trim() === '';
+
+            if (isExplicitlyUnplayable || hasErrorCode || isBlankTitle) {
+              markTrailerBlocked(trailer?.src);
+              setTrailerError(true);
+              setIsVideoReady(false);
+              setTrailerVerifiedPlayable(false);
+              return;
+            }
+          }
+
+          // Track latest player state
+          const rawState = typeof data.info === 'number' ? data.info : data.info?.playerState;
+          if (typeof rawState === 'number') {
+            lastPlayerStateRef.current = rawState;
+          }
+
+          // 3. When onReady arrives, trigger playback and mute handshake, but do NOT reveal iframe yet
           if (data.event === 'onReady') {
             const win = iframeRef.current?.contentWindow;
             if (win) {
@@ -169,27 +238,62 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
                 win.postMessage(JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*');
               } catch {}
             }
+
+            // Fast post-onReady watchdog: if after 450ms player state hasn't advanced to PLAYING (1) or BUFFERING (3), mark blocked
+            if (readyCheckTimerRef.current) clearTimeout(readyCheckTimerRef.current);
+            readyCheckTimerRef.current = window.setTimeout(() => {
+              if (lastPlayerStateRef.current !== 1 && lastPlayerStateRef.current !== 3) {
+                markTrailerBlocked(trailer?.src);
+                setTrailerError(true);
+                setIsVideoReady(false);
+                setTrailerVerifiedPlayable(false);
+              }
+            }, 450);
             return;
           }
 
-          // STRICT REVEAL: ONLY set isVideoReady = true when YouTube explicitly confirms PLAYING (state === 1)
+          // 4. STRICT REVEAL: ONLY set isVideoReady = true when YouTube explicitly confirms PLAYING (state === 1)
           const isPlayingState =
             (data.event === 'onStateChange' && data.info === 1) ||
             (data.info && data.info.playerState === 1);
 
           if (isPlayingState) {
+            if (readyCheckTimerRef.current) {
+              clearTimeout(readyCheckTimerRef.current);
+              readyCheckTimerRef.current = null;
+            }
+            if (fallbackWatchdogRef.current) {
+              clearTimeout(fallbackWatchdogRef.current);
+              fallbackWatchdogRef.current = null;
+            }
+            markTrailerPlayable(trailer?.src);
+            setTrailerVerifiedPlayable(true);
             setIsVideoReady(true);
             setTrailerError(false);
           }
         }
       } catch {
-        // Ignore unparseable or third-party extension messages safely
+        if (
+          typeof event.data === 'string' &&
+          (event.data.includes('onError') || event.data.includes('onPlayerError') || event.data.includes('"error"'))
+        ) {
+          markTrailerBlocked(trailer?.src);
+          setTrailerError(true);
+          setIsVideoReady(false);
+          setTrailerVerifiedPlayable(false);
+        }
       }
     };
 
     window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, []);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      if (readyCheckTimerRef.current) {
+        clearTimeout(readyCheckTimerRef.current);
+        readyCheckTimerRef.current = null;
+      }
+    };
+  }, [trailer?.src]);
 
   // Initiate YouTube JS API handshake on iframe load
   const handleIframeLoad = () => {
@@ -213,13 +317,21 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
   useEffect(() => {
     if (!trailer || trailer.type !== 'youtube' || isVideoReady || trailerError) return;
 
-    const timer = setTimeout(() => {
+    if (fallbackWatchdogRef.current) clearTimeout(fallbackWatchdogRef.current);
+    fallbackWatchdogRef.current = window.setTimeout(() => {
+      markTrailerBlocked(trailer.src);
       setTrailerError(true);
       setIsVideoReady(false);
+      setTrailerVerifiedPlayable(false);
     }, 4500);
 
-    return () => clearTimeout(timer);
-  }, [trailer, isVideoReady, trailerError]);
+    return () => {
+      if (fallbackWatchdogRef.current) {
+        clearTimeout(fallbackWatchdogRef.current);
+        fallbackWatchdogRef.current = null;
+      }
+    };
+  }, [trailer?.src, trailer?.type, isVideoReady, trailerError]);
 
   // Active in view observer: Pauses when scrolled out of view, resumes when scrolled in view
   useEffect(() => {
@@ -383,8 +495,10 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
                 referrerPolicy="origin"
                 allow="autoplay; encrypted-media; picture-in-picture"
                 onError={() => {
+                  markTrailerBlocked(trailer.src);
                   setTrailerError(true);
                   setIsVideoReady(false);
+                  setTrailerVerifiedPlayable(false);
                 }}
               />
             </div>
@@ -398,10 +512,17 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
               loop
               playsInline
               className="w-full h-full object-cover"
-              onLoadedData={() => setIsVideoReady(true)}
+              onPlay={() => {
+                markTrailerPlayable(trailer.src);
+                setTrailerVerifiedPlayable(true);
+                setIsVideoReady(true);
+                setTrailerError(false);
+              }}
               onError={() => {
+                markTrailerBlocked(trailer.src);
                 setTrailerError(true);
                 setIsVideoReady(false);
+                setTrailerVerifiedPlayable(false);
               }}
             />
           )}
@@ -465,7 +586,7 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
               : 'Play'}
           </button>
 
-          {trailer && !trailerError && (
+          {trailer && !trailerError && (isVideoReady || trailerVerifiedPlayable) && (
             <button
               onClick={() => openTrailer(item, trailer.src)}
               className="px-5 sm:px-6 py-3 bg-neutral-900/80 hover:bg-neutral-800 text-white font-bold text-sm rounded-xl transition duration-200 backdrop-blur-md flex items-center gap-2 border border-white/20 cursor-pointer shadow-xl group"

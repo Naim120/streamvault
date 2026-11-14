@@ -11,17 +11,26 @@ import { CustomList, Episode, MediaItem, Season, WatchProgressItem } from '../..
 import { MediaImage } from '../common/MediaImage';
 import { extractSafeTrailer } from '../../lib/security';
 import { prewarmStream } from '../../lib/streamPrewarm';
+import {
+  isTrailerBlocked,
+  isTrailerPlayable,
+  markTrailerBlocked,
+  markTrailerPlayable
+} from '../../lib/trailerValidator';
 
 export const DetailModal: React.FC = () => {
   const { detailMedia: media, closeDetail, showToast, openDetail, progressRefreshTrigger } = useUIStore();
   const { openPlayer, openTrailer, isOpen: isPlayerOpen } = usePlayerStore();
   const { user } = useAuthStore();
 
+  const trailer = extractSafeTrailer(media?.trailer_youtube_key);
+
   const [activeTab, setActiveTab] = useState<'episodes' | 'more'>('episodes');
   const [trailerMuted, setTrailerMuted] = useState(true);
   const [trailerPlaying, setTrailerPlaying] = useState(true);
   const [trailerReady, setTrailerReady] = useState(false);
-  const [trailerError, setTrailerError] = useState(false);
+  const [trailerError, setTrailerError] = useState(() => isTrailerBlocked(trailer?.src));
+  const [trailerVerifiedPlayable, setTrailerVerifiedPlayable] = useState(() => isTrailerPlayable(trailer?.src));
   const [userLiked, setUserLiked] = useState(false);
   const [watchProgress, setWatchProgress] = useState<WatchProgressItem | null>(null);
   const [activeResumeEpisode, setActiveResumeEpisode] = useState<Episode | null>(null);
@@ -32,6 +41,9 @@ export const DetailModal: React.FC = () => {
   const trailerContainerRef = useRef<HTMLDivElement | null>(null);
   const trailerIframeRef = useRef<HTMLIFrameElement | null>(null);
   const trailerVideoRef = useRef<HTMLVideoElement | null>(null);
+  const lastPlayerStateRef = useRef<number | null>(null);
+  const readyCheckTimerRef = useRef<number | null>(null);
+  const fallbackWatchdogRef = useRef<number | null>(null);
 
   // Series Specific
   const [seasons, setSeasons] = useState<Season[]>([]);
@@ -79,13 +91,39 @@ export const DetailModal: React.FC = () => {
     };
   }, []);
 
-  const trailer = extractSafeTrailer(media?.trailer_youtube_key);
-
-  // Reset trailer states on media change
+  // Sync trailer states on media change or trailer source change
   useEffect(() => {
-    setTrailerError(false);
+    setTrailerError(isTrailerBlocked(trailer?.src));
+    setTrailerVerifiedPlayable(isTrailerPlayable(trailer?.src));
     setTrailerReady(false);
-  }, [media?.id]);
+    lastPlayerStateRef.current = null;
+    if (readyCheckTimerRef.current) {
+      clearTimeout(readyCheckTimerRef.current);
+      readyCheckTimerRef.current = null;
+    }
+    if (fallbackWatchdogRef.current) {
+      clearTimeout(fallbackWatchdogRef.current);
+      fallbackWatchdogRef.current = null;
+    }
+  }, [media?.id, trailer?.src]);
+
+  // Listen for broadcast trailer status changes across the app
+  useEffect(() => {
+    const handleStatusChange = (e: Event) => {
+      const detail = (e as CustomEvent).detail;
+      if (detail && detail.src === trailer?.src) {
+        if (detail.status === 'blocked') {
+          setTrailerError(true);
+          setTrailerReady(false);
+          setTrailerVerifiedPlayable(false);
+        } else if (detail.status === 'playable') {
+          setTrailerVerifiedPlayable(true);
+        }
+      }
+    };
+    window.addEventListener('sv:trailer-status', handleStatusChange);
+    return () => window.removeEventListener('sv:trailer-status', handleStatusChange);
+  }, [trailer?.src]);
 
   // Listen for YouTube player events to reveal on play or fallback gracefully to backdrop poster
   useEffect(() => {
@@ -94,17 +132,45 @@ export const DetailModal: React.FC = () => {
       try {
         const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
         if (data && typeof data === 'object') {
+          // 1. YouTube error event or standard error codes (e.g. 100, 101, 150)
           if (
             data.event === 'onError' ||
             data.event === 'onPlayerError' ||
             (data.info && (data.info.error || [2, 5, 100, 101, 150].includes(data.info)))
           ) {
+            markTrailerBlocked(trailer?.src);
             setTrailerError(true);
             setTrailerReady(false);
+            setTrailerVerifiedPlayable(false);
             return;
           }
 
-          // When onReady arrives, trigger playback and mute handshake, but do NOT reveal iframe yet
+          // 2. Instant bot-check & unplayable video detection in initialDelivery / infoDelivery (<150ms)
+          const vd = data.info?.videoData;
+          if (vd) {
+            const isExplicitlyUnplayable = vd.isPlayable === false;
+            const hasErrorCode = Boolean(vd.errorCode);
+            const isBlankTitle =
+              (data.event === 'initialDelivery' || data.event === 'infoDelivery') &&
+              typeof vd.title === 'string' &&
+              vd.title.trim() === '';
+
+            if (isExplicitlyUnplayable || hasErrorCode || isBlankTitle) {
+              markTrailerBlocked(trailer?.src);
+              setTrailerError(true);
+              setTrailerReady(false);
+              setTrailerVerifiedPlayable(false);
+              return;
+            }
+          }
+
+          // Track latest player state
+          const rawState = typeof data.info === 'number' ? data.info : data.info?.playerState;
+          if (typeof rawState === 'number') {
+            lastPlayerStateRef.current = rawState;
+          }
+
+          // 3. When onReady arrives, trigger playback and mute handshake, but do NOT reveal iframe yet
           if (data.event === 'onReady') {
             const win = trailerIframeRef.current?.contentWindow;
             if (win) {
@@ -113,15 +179,36 @@ export const DetailModal: React.FC = () => {
                 win.postMessage(JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*');
               } catch {}
             }
+
+            // Fast post-onReady watchdog: if after 450ms player state hasn't advanced to PLAYING (1) or BUFFERING (3), mark blocked
+            if (readyCheckTimerRef.current) clearTimeout(readyCheckTimerRef.current);
+            readyCheckTimerRef.current = window.setTimeout(() => {
+              if (lastPlayerStateRef.current !== 1 && lastPlayerStateRef.current !== 3) {
+                markTrailerBlocked(trailer?.src);
+                setTrailerError(true);
+                setTrailerReady(false);
+                setTrailerVerifiedPlayable(false);
+              }
+            }, 450);
             return;
           }
 
-          // STRICT REVEAL: ONLY set trailerReady = true when YouTube explicitly confirms PLAYING (state === 1)
+          // 4. STRICT REVEAL: ONLY confirm trailerReady & trailerVerifiedPlayable when YouTube explicitly confirms PLAYING (state === 1)
           const isPlayingState =
             (data.event === 'onStateChange' && data.info === 1) ||
             (data.info && data.info.playerState === 1);
 
           if (isPlayingState) {
+            if (readyCheckTimerRef.current) {
+              clearTimeout(readyCheckTimerRef.current);
+              readyCheckTimerRef.current = null;
+            }
+            if (fallbackWatchdogRef.current) {
+              clearTimeout(fallbackWatchdogRef.current);
+              fallbackWatchdogRef.current = null;
+            }
+            markTrailerPlayable(trailer?.src);
+            setTrailerVerifiedPlayable(true);
             setTrailerReady(true);
             setTrailerError(false);
           }
@@ -131,15 +218,23 @@ export const DetailModal: React.FC = () => {
           typeof event.data === 'string' &&
           (event.data.includes('onError') || event.data.includes('onPlayerError') || event.data.includes('"error"'))
         ) {
+          markTrailerBlocked(trailer?.src);
           setTrailerError(true);
           setTrailerReady(false);
+          setTrailerVerifiedPlayable(false);
         }
       }
     };
 
     window.addEventListener('message', handleMessage);
-    return () => window.removeEventListener('message', handleMessage);
-  }, []);
+    return () => {
+      window.removeEventListener('message', handleMessage);
+      if (readyCheckTimerRef.current) {
+        clearTimeout(readyCheckTimerRef.current);
+        readyCheckTimerRef.current = null;
+      }
+    };
+  }, [trailer?.src]);
 
   const handleTrailerIframeLoad = () => {
     const win = trailerIframeRef.current?.contentWindow;
@@ -158,17 +253,25 @@ export const DetailModal: React.FC = () => {
     } catch {}
   };
 
-  // Fallback watchdog: If YouTube trailer genuinely fails to reach PLAYING within 4.5s (e.g. bot check wall, ad-blocker), fallback cleanly to backdrop poster
+  // Fallback watchdog: If YouTube trailer genuinely fails to reach PLAYING within 4.5s (e.g. ad-blocker or silent drop), fallback cleanly to backdrop poster
   useEffect(() => {
     if (!trailer || trailer.type !== 'youtube' || trailerReady || trailerError) return;
 
-    const timer = setTimeout(() => {
+    if (fallbackWatchdogRef.current) clearTimeout(fallbackWatchdogRef.current);
+    fallbackWatchdogRef.current = window.setTimeout(() => {
+      markTrailerBlocked(trailer.src);
       setTrailerError(true);
       setTrailerReady(false);
+      setTrailerVerifiedPlayable(false);
     }, 4500);
 
-    return () => clearTimeout(timer);
-  }, [trailer, trailerReady, trailerError]);
+    return () => {
+      if (fallbackWatchdogRef.current) {
+        clearTimeout(fallbackWatchdogRef.current);
+        fallbackWatchdogRef.current = null;
+      }
+    };
+  }, [trailer?.src, trailer?.type, trailerReady, trailerError]);
 
   // Pause DetailModal trailer whenever the video player is open
   useEffect(() => {
@@ -833,8 +936,10 @@ export const DetailModal: React.FC = () => {
                     referrerPolicy="origin"
                     allow="autoplay; encrypted-media; picture-in-picture"
                     onError={() => {
+                      markTrailerBlocked(trailer.src);
                       setTrailerError(true);
                       setTrailerReady(false);
+                      setTrailerVerifiedPlayable(false);
                     }}
                   />
                 </div>
@@ -848,10 +953,17 @@ export const DetailModal: React.FC = () => {
                   loop
                   playsInline
                   className="w-full h-full object-cover"
-                  onLoadedData={() => setTrailerReady(true)}
+                  onPlay={() => {
+                    markTrailerPlayable(trailer.src);
+                    setTrailerVerifiedPlayable(true);
+                    setTrailerReady(true);
+                    setTrailerError(false);
+                  }}
                   onError={() => {
+                    markTrailerBlocked(trailer.src);
                     setTrailerError(true);
                     setTrailerReady(false);
+                    setTrailerVerifiedPlayable(false);
                   }}
                 />
               )}
@@ -859,7 +971,7 @@ export const DetailModal: React.FC = () => {
           )}
 
           {/* Floating Trailer Media Controls: Moved to top-right on mobile to prevent overlapping continue watching title & progress bar */}
-          {trailer && !trailerError && (
+          {trailer && trailerReady && !trailerError && (
             <div className="absolute top-4 sm:top-auto sm:bottom-6 right-4 sm:right-8 z-30 flex items-center gap-2 sm:gap-2.5">
               <button
                 onClick={toggleTrailerPlayback}
@@ -1107,8 +1219,8 @@ export const DetailModal: React.FC = () => {
                 </button>
               </div>
 
-              {/* Watch Trailer Button placed below Play button */}
-              {trailer && !trailerError && (
+              {/* Watch Trailer Button placed below Play button (rendered only when verified playable or ready, zero 4-second popout) */}
+              {trailer && !trailerError && (trailerReady || trailerVerifiedPlayable) && (
                 <div className="flex items-center">
                   <button
                     onClick={() => {

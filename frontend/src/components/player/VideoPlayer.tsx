@@ -15,6 +15,12 @@ import { MediaImage } from '../common/MediaImage';
 
 import { stripHtmlTags, extractSafeTrailer } from '../../lib/security';
 import { getPrewarmedStream, invalidatePrewarmCache } from '../../lib/streamPrewarm';
+import {
+  isTrailerBlocked,
+  isTrailerPlayable,
+  markTrailerBlocked,
+  markTrailerPlayable
+} from '../../lib/trailerValidator';
 
 interface VttCue {
   start: number;
@@ -272,11 +278,11 @@ export const VideoPlayer: React.FC = () => {
   const [pendingSubtitleIndex, setPendingSubtitleIndex] = useState<number>(-1);
 
   // Trailer Error state: falls back to backdrop poster if trailer is missing or fails
-  const [trailerError, setTrailerError] = useState(false);
+  const [trailerError, setTrailerError] = useState(() => isTrailerBlocked(trailer?.src));
 
   useEffect(() => {
-    setTrailerError(false);
-  }, [media?.id]);
+    setTrailerError(isTrailerBlocked(trailer?.src));
+  }, [media?.id, trailer?.src]);
 
   // Lock body & html scroll to eliminate background homepage scrollbar and page shift
   useEffect(() => {
@@ -297,13 +303,41 @@ export const VideoPlayer: React.FC = () => {
     const handleMessage = (event: MessageEvent) => {
       try {
         const data = typeof event.data === 'string' ? JSON.parse(event.data) : event.data;
-        if (
-          data &&
-          (data.event === 'onError' ||
-           data.event === 'onPlayerError' ||
-           (data.info && (data.info.error || [2, 5, 100, 101, 150].includes(data.info))))
-        ) {
-          setTrailerError(true);
+        if (data && typeof data === 'object') {
+          if (
+            data.event === 'onError' ||
+            data.event === 'onPlayerError' ||
+            (data.info && (data.info.error || [2, 5, 100, 101, 150].includes(data.info)))
+          ) {
+            markTrailerBlocked(trailer?.src);
+            setTrailerError(true);
+            return;
+          }
+
+          const vd = data.info?.videoData;
+          if (vd) {
+            const isExplicitlyUnplayable = vd.isPlayable === false;
+            const hasErrorCode = Boolean(vd.errorCode);
+            const isBlankTitle =
+              (data.event === 'initialDelivery' || data.event === 'infoDelivery') &&
+              typeof vd.title === 'string' &&
+              vd.title.trim() === '';
+
+            if (isExplicitlyUnplayable || hasErrorCode || isBlankTitle) {
+              markTrailerBlocked(trailer?.src);
+              setTrailerError(true);
+              return;
+            }
+          }
+
+          const isPlayingState =
+            (data.event === 'onStateChange' && data.info === 1) ||
+            (data.info && data.info.playerState === 1);
+
+          if (isPlayingState) {
+            markTrailerPlayable(trailer?.src);
+            setTrailerError(false);
+          }
         }
       } catch {
         if (
@@ -312,6 +346,7 @@ export const VideoPlayer: React.FC = () => {
            event.data.includes('onPlayerError') ||
            event.data.includes('"error"'))
         ) {
+          markTrailerBlocked(trailer?.src);
           setTrailerError(true);
         }
       }
@@ -319,7 +354,7 @@ export const VideoPlayer: React.FC = () => {
 
     window.addEventListener('message', handleMessage);
     return () => window.removeEventListener('message', handleMessage);
-  }, [isTrailer]);
+  }, [isTrailer, trailer?.src]);
 
   // 1. Resolve Stream Manifest URL, Token, Episode, and Seek Position Atomically
   useEffect(() => {
@@ -1635,7 +1670,10 @@ export const VideoPlayer: React.FC = () => {
                 referrerPolicy="origin"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
-                onError={() => setTrailerError(true)}
+                onError={() => {
+                  markTrailerBlocked(trailer.src);
+                  setTrailerError(true);
+                }}
               />
             ) : (
               <video
@@ -1643,7 +1681,14 @@ export const VideoPlayer: React.FC = () => {
                 controls
                 autoPlay
                 className="w-full h-full object-contain"
-                onError={() => setTrailerError(true)}
+                onPlay={() => {
+                  markTrailerPlayable(trailer.src);
+                  setTrailerError(false);
+                }}
+                onError={() => {
+                  markTrailerBlocked(trailer.src);
+                  setTrailerError(true);
+                }}
               />
             )}
           </div>

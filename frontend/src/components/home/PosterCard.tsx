@@ -4,6 +4,7 @@ import { MediaItem } from '../../types';
 import { useUIStore } from '../../store/useUIStore';
 import { usePlayerStore } from '../../store/usePlayerStore';
 import { MediaImage } from '../common/MediaImage';
+import { prevalidateTrailer } from '../../lib/trailerValidator';
 
 export interface PosterCardProps {
   media: MediaItem;
@@ -45,6 +46,16 @@ export const PosterCard: React.FC<PosterCardProps> = ({
       data-tv-card="true"
       aria-label={`View details for ${media.title}`}
       onClick={() => openDetail(media)}
+      onMouseEnter={() => {
+        if (media.trailer_youtube_key) {
+          prevalidateTrailer(media.trailer_youtube_key);
+        }
+      }}
+      onFocus={() => {
+        if (media.trailer_youtube_key) {
+          prevalidateTrailer(media.trailer_youtube_key);
+        }
+      }}
       onKeyDown={(e) => {
         if (e.key === 'Enter' || e.key === ' ') {
           e.preventDefault();
