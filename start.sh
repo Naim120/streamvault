@@ -568,7 +568,7 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
         rm -f "$DIR/.nginx/cloudflared.pid"
       fi
       pkill -f "cloudflared.*8080" 2>/dev/null || true
-      local cf_bin="cloudflared"
+      cf_bin="cloudflared"
       if ! command -v cloudflared >/dev/null 2>&1 && [ -f "$DIR/cloudflared" ]; then
         cf_bin="$DIR/cloudflared"
       fi
