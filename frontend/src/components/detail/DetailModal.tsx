@@ -597,11 +597,9 @@ export const DetailModal: React.FC = () => {
     fetchSimilar();
   }, [media]);
 
-  if (!media) return null;
-
   // Like Toggle
   const handleToggleLike = async () => {
-    if (!user) return;
+    if (!user || !media) return;
     const newLiked = !userLiked;
     setUserLiked(newLiked);
 
@@ -616,7 +614,7 @@ export const DetailModal: React.FC = () => {
 
   // Custom List Toggle
   const handleToggleList = async (listId: string) => {
-    if (!user) return;
+    if (!user || !media) return;
     const isCurrentlyIn = inListIds.has(listId);
     const updated = new Set(inListIds);
 
@@ -634,7 +632,7 @@ export const DetailModal: React.FC = () => {
 
   // Create List
   const handleCreateList = async () => {
-    if (!user || !newListName.trim() || isCreatingList) return;
+    if (!user || !media || !newListName.trim() || isCreatingList) return;
     setIsCreatingList(true);
     try {
       const { data, error } = await supabase
@@ -656,6 +654,7 @@ export const DetailModal: React.FC = () => {
 
   // Share Link with Visual Feedback & Toast
   const handleShare = async () => {
+    if (!media) return;
     const shareUrl = `${window.location.origin}/home/${media.id}`;
     let copied = false;
     try {
@@ -691,10 +690,22 @@ export const DetailModal: React.FC = () => {
     }, 2500);
   };
 
-  const isSeries = media.type === 'series';
+  const isSeries = media?.type === 'series';
 
   // Smart primary CTA resolution (Resume / Continue / Play Again / Play)
   const ctaResolution = React.useMemo(() => {
+    if (!media) {
+      return {
+        mode: 'play',
+        label: 'Play',
+        subtitle: '',
+        targetEpisode: null,
+        targetSeekTime: 0,
+        showProgressBar: false,
+        progressPct: 0,
+        remainingMinutes: 0
+      };
+    }
     if (!isSeries) {
       const hasMovieResume = Boolean(
         watchProgress &&
@@ -856,6 +867,7 @@ export const DetailModal: React.FC = () => {
 
   // Primary CTA Action: Play / Resume / Continue
   const handlePrimaryCTA = () => {
+    if (!media) return;
     if (ctaResolution.targetEpisode) {
       if (selectedSeasonNumber !== ctaResolution.targetEpisode.season_number) {
         setSelectedSeasonNumber(ctaResolution.targetEpisode.season_number);
@@ -865,6 +877,8 @@ export const DetailModal: React.FC = () => {
       openPlayer(media, null, ctaResolution.targetSeekTime);
     }
   };
+
+  if (!media) return null;
 
   return (
     <div className="fixed inset-0 z-50 bg-[#141414] overflow-y-auto text-white animate-fade-in">

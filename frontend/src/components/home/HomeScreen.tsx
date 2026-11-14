@@ -43,32 +43,6 @@ export const HomeScreen: React.FC = () => {
     staleTime: 1000 * 60 * 5
   });
 
-  if (isLoading) {
-    return (
-      <div className="min-h-screen bg-black pt-20 px-4 sm:px-8 space-y-8 animate-pulse">
-        <div className="w-full h-[60vh] bg-neutral-900 rounded-2xl" />
-        <div className="h-44 bg-neutral-900 rounded-xl" />
-        <div className="h-44 bg-neutral-900 rounded-xl" />
-      </div>
-    );
-  }
-
-  // Intelligent tokenized genre matching
-  const filteredAll = selectedGenre && allMedia
-    ? allMedia.filter(m => {
-        if (!m.genres || m.genres.length === 0) return false;
-        const tokens = selectedGenre
-          .toLowerCase()
-          .split(/&|\/|,|\s+and\s+/)
-          .map(t => t.trim())
-          .filter(Boolean);
-        return m.genres.some(itemGenre => {
-          const itemLower = itemGenre.toLowerCase();
-          return tokens.some(t => itemLower.includes(t) || t.includes(itemLower));
-        });
-      })
-    : allMedia || [];
-
   // Pinned billboard priority resolution:
   // Prioritize published items with is_featured_billboard === true (ordered by billboard_priority DESC, updated_at DESC)
   const pinnedBillboards = (allMedia || [])
@@ -108,6 +82,32 @@ export const HomeScreen: React.FC = () => {
       }
     });
   }, [featuredItem?.id, featuredItem?.trailer_youtube_key, feedData]);
+
+  if (isLoading) {
+    return (
+      <div className="min-h-screen bg-black pt-20 px-4 sm:px-8 space-y-8 animate-pulse">
+        <div className="w-full h-[60vh] bg-neutral-900 rounded-2xl" />
+        <div className="h-44 bg-neutral-900 rounded-xl" />
+        <div className="h-44 bg-neutral-900 rounded-xl" />
+      </div>
+    );
+  }
+
+  // Intelligent tokenized genre matching
+  const filteredAll = selectedGenre && allMedia
+    ? allMedia.filter(m => {
+        if (!m.genres || m.genres.length === 0) return false;
+        const tokens = selectedGenre
+          .toLowerCase()
+          .split(/&|\/|,|\s+and\s+/)
+          .map(t => t.trim())
+          .filter(Boolean);
+        return m.genres.some(itemGenre => {
+          const itemLower = itemGenre.toLowerCase();
+          return tokens.some(t => itemLower.includes(t) || t.includes(itemLower));
+        });
+      })
+    : allMedia || [];
 
   // Helper for genre filtering
   const getGenreItems = (keyword: string) => {

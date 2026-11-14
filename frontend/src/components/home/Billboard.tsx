@@ -114,8 +114,6 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
     }
   };
 
-  if (!item) return null;
-
   useEffect(() => {
     let isMounted = true;
     // Immediately synchronize liveTrailerKey with the current item (resets to null if item has no trailer!)
@@ -435,6 +433,8 @@ export const Billboard: React.FC<BillboardProps> = ({ item, resumeProgress }) =>
     !detailMedia &&
     !isPlayerOpen
   );
+
+  if (!item) return null;
 
   return (
     <div
