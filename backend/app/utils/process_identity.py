@@ -37,8 +37,23 @@ def ensure_branded_symlinks(root_dir: Path) -> dict[str, str]:
     bin_dir = root_dir / ".bin"
     bin_dir.mkdir(parents=True, exist_ok=True)
 
-    ffmpeg_path = shutil.which("ffmpeg") or "/usr/bin/ffmpeg"
-    aria2c_path = shutil.which("aria2c") or "/home/naim/.local/bin/aria2c"
+    ffmpeg_path = shutil.which("ffmpeg")
+    if not ffmpeg_path:
+        for candidate in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", str(Path.home() / ".local" / "bin" / "ffmpeg")]:
+            if os.path.exists(candidate):
+                ffmpeg_path = candidate
+                break
+    if not ffmpeg_path:
+        ffmpeg_path = "/usr/bin/ffmpeg"
+
+    aria2c_path = shutil.which("aria2c")
+    if not aria2c_path:
+        for candidate in [str(Path.home() / ".local" / "bin" / "aria2c"), "/usr/bin/aria2c", "/usr/local/bin/aria2c"]:
+            if os.path.exists(candidate):
+                aria2c_path = candidate
+                break
+    if not aria2c_path:
+        aria2c_path = "/usr/bin/aria2c"
 
     transcoder_link = bin_dir / "streamvault-transcoder"
     downloader_link = bin_dir / "streamvault-downloader"

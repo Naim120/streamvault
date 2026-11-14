@@ -1739,7 +1739,7 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
             <div class="bg-neutral-900/60 border border-neutral-800 rounded-xl p-8 text-center space-y-2">
               <div class="w-10 h-10 mx-auto rounded-full bg-neutral-800 text-neutral-400 flex items-center justify-center font-bold text-lg">📁</div>
               <h5 class="text-white font-bold text-sm">No files found in media/incoming</h5>
-              <p class="text-neutral-400 text-xs">Drop or upload video files into <code class="font-mono text-neutral-300">/home/naim/netflix/media/incoming</code> to process them.</p>
+              <p class="text-neutral-400 text-xs">Drop or upload video files into <code class="font-mono text-neutral-300">media/incoming</code> to process them.</p>
             </div>
           `;
         }

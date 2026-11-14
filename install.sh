@@ -823,6 +823,12 @@ map "\$remote_addr:\$http_cf_ray" \$trusted_cf_pseudo_ipv4 {
     default                    "";
 }
 
+map "\$remote_addr:\$http_cf_ray:\$http_x_real_ip" \$trusted_client_real_ip {
+    "~^(127\.0\.0\.1|::1):[^:]+:.*"  \$http_cf_connecting_ip;
+    "~^(127\.0\.0\.1|::1)::.+"       \$http_x_real_ip;
+    default                          \$remote_addr;
+}
+
 server {
     listen ${NGINX_PORT:-8080} default_server;
     listen [::]:${NGINX_PORT:-8080} default_server;
@@ -878,8 +884,8 @@ server {
 
         # Forward real client headers for security and rate limiting
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Real-IP \$trusted_client_real_ip;
+        proxy_set_header X-Forwarded-For \$trusted_client_real_ip;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_set_header CF-Connecting-IP \$trusted_cf_ip;
         proxy_set_header CF-IPCountry \$trusted_cf_country;
@@ -898,8 +904,8 @@ server {
         proxy_pass http://127.0.0.1:8000/media/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Real-IP \$trusted_client_real_ip;
+        proxy_set_header X-Forwarded-For \$trusted_client_real_ip;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
     }
@@ -917,8 +923,8 @@ server {
         proxy_pass http://127.0.0.1:8000/sitemap.xml;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
-        proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Real-IP \$trusted_client_real_ip;
+        proxy_set_header X-Forwarded-For \$trusted_client_real_ip;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_intercept_errors on;
         error_page 502 503 504 = @static_sitemap;
@@ -944,6 +950,11 @@ server {
     }
 }
 EOF
+
+  # Ensure standalone nginx.conf is also synchronized with the target installation directory
+  if [ -f "${TARGET_DIR}/nginx.conf" ]; then
+    sed -i "s|/var/www/streamvault|${TARGET_DIR}|g; s|/home/naim/netflix|${TARGET_DIR}|g" "${TARGET_DIR}/nginx.conf" 2>/dev/null || true
+  fi
 
   if [ -d /etc/nginx/conf.d ]; then
     chmod o+x "$HOME" "$TARGET_DIR" "${TARGET_DIR}/frontend" "${TARGET_DIR}/frontend/dist" 2>/dev/null || true

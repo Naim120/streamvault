@@ -75,6 +75,32 @@ LAST_MODE="${LAST_MODE}"
 EOF
 }
 
+# Ensure runtime temp directories exist and dynamically generate portable Nginx configuration
+prepare_nginx_conf() {
+  mkdir -p "$DIR/.nginx/client_body" "$DIR/.nginx/proxy" "$DIR/.nginx/fastcgi" "$DIR/.nginx/uwsgi" "$DIR/.nginx/scgi" "$DIR/logs"
+  chmod 700 "$DIR/.nginx" "$DIR/logs" 2>/dev/null || true
+
+  local nginx_template="$DIR/nginx.conf"
+  local nginx_runtime="$DIR/.nginx/nginx.conf"
+
+  if [ -f "$nginx_template" ]; then
+    # Dynamically rewrite template directory paths to the current project directory ($DIR)
+    sed \
+      -e "s|/var/www/streamvault|$DIR|g" \
+      -e "s|/home/naim/netflix|$DIR|g" \
+      -e "s|{{STREAMVAULT_DIR}}|$DIR|g" \
+      "$nginx_template" > "$nginx_runtime"
+  fi
+}
+
+get_nginx_conf() {
+  if [ -f "$DIR/.nginx/nginx.conf" ]; then
+    echo "$DIR/.nginx/nginx.conf"
+  else
+    echo "$DIR/nginx.conf"
+  fi
+}
+
 # ==============================================================================
 # SUB-COMMAND: STATUS
 # ==============================================================================
@@ -173,7 +199,9 @@ stop_all_services() {
   pkill -x "aria2c" 2>/dev/null || true
 
   if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
-    nginx -c "$DIR/nginx.conf" -s quit 2>/dev/null || true
+    local conf_file
+    conf_file="$(get_nginx_conf)"
+    nginx -c "$conf_file" -s quit 2>/dev/null || true
   fi
   rm -f "$DIR/.nginx/nginx.pid" 2>/dev/null || true
 }
@@ -360,10 +388,12 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   fi
 
   echo "Starting Nginx single-origin gateway on port 8080..."
+  prepare_nginx_conf
+  conf_file="$(get_nginx_conf)"
   if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
-    nginx -c "$DIR/nginx.conf" -s reload
+    nginx -c "$conf_file" -s reload
   else
-    nginx -c "$DIR/nginx.conf"
+    nginx -c "$conf_file"
   fi
 
   # Check for authenticated Named Tunnel from install.sh
@@ -452,7 +482,9 @@ cleanup() {
   kill $MEDIA_PID $ADMIN_PID ${FRONTEND_PID:-} ${TUNNEL_PID:-} 2>/dev/null || true
   pkill -x "aria2c" 2>/dev/null || true
   if [ -f "$DIR/.nginx/nginx.pid" ]; then
-    nginx -c "$DIR/nginx.conf" -s quit 2>/dev/null || true
+    local conf_file
+    conf_file="$(get_nginx_conf)"
+    nginx -c "$conf_file" -s quit 2>/dev/null || true
   fi
   exit 0
 }
