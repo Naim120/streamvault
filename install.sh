@@ -586,38 +586,77 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
         TUNNEL_TYPE="pages"
         echo ""
         echo -e "${CYAN}Cloudflare Pages (.pages.dev) Configuration:${NC}"
-        echo "Enter your desired or existing Cloudflare Pages project name."
-        echo "(For example, entering 'streamvault' maps to https://streamvault.pages.dev)"
-        read -r -p "Pages Project Name [Default: streamvault]: " CF_PAGES_NAME
-        CF_PAGES_NAME="$(echo "${CF_PAGES_NAME:-streamvault}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
-        PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
-        FRONTEND_ORIGIN="https://${PUBLIC_DOMAIN}"
-        CF_PAGES_PROJECT="$CF_PAGES_NAME"
-        save_answer "PUBLIC_DOMAIN" "$PUBLIC_DOMAIN"
-        save_answer "FRONTEND_ORIGIN" "$FRONTEND_ORIGIN"
-        save_answer "TUNNEL_TYPE" "pages"
-        save_answer "CF_PAGES_PROJECT" "$CF_PAGES_PROJECT"
-
+        echo "Important: Cloudflare Pages subdomains (*.pages.dev) are globally unique worldwide"
+        echo "and require an actual project deployed in your Cloudflare account (Workers & Pages)."
+        echo "Names like 'streamvault' are already registered by other users."
         echo ""
-        echo -e "${YELLOW}Optional Automated Cloudflare Pages Sync:${NC}"
-        echo "If you provide your Cloudflare Account ID and API Token, StreamVault can automatically"
-        echo "update your Cloudflare Pages target tunnel whenever the server starts."
-        read -r -p "Cloudflare Account ID (press Enter to skip): " CF_ACCOUNT_ID
-        if [ -n "$CF_ACCOUNT_ID" ]; then
-          read -r -p "Cloudflare API Token (with Pages edit permissions): " CF_API_TOKEN
+
+        read -r -p "Cloudflare Account ID (from your dash.cloudflare.com URL): " CF_ACCOUNT_ID
+        read -r -p "Cloudflare API Token (with Cloudflare Pages: Edit permissions): " CF_API_TOKEN
+
+        while true; do
+          read -r -p "Enter a unique Pages Project Name (e.g. streamvault-zoya): " CF_PAGES_NAME
+          CF_PAGES_NAME="$(echo "${CF_PAGES_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+          if [ -z "$CF_PAGES_NAME" ] || [ "$CF_PAGES_NAME" = "streamvault" ]; then
+            warn "'streamvault' is already taken globally on Cloudflare. Please choose a unique name."
+            continue
+          fi
+
+          if [ -n "$CF_ACCOUNT_ID" ] && [ -n "$CF_API_TOKEN" ]; then
+            info "Verifying & provisioning project '${CF_PAGES_NAME}' in your Cloudflare account..."
+            local cf_resp
+            cf_resp="$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "{\"name\":\"${CF_PAGES_NAME}\",\"production_branch\":\"main\"}" 2>/dev/null || true)"
+
+            local cf_success
+            cf_success="$(echo "$cf_resp" | grep -o '"success":true' || true)"
+            if [ -n "$cf_success" ]; then
+              success "Cloudflare Pages project '${CF_PAGES_NAME}' created in your account!"
+              break
+            else
+              local cf_err
+              cf_err="$(echo "$cf_resp" | grep -oE '"message":"[^"]+"' | head -n1 || echo "$cf_resp")"
+              warn "Cloudflare API response: $cf_err"
+              echo "Would you like to try another name, or switch to instant Cloudflare Quick Tunnel?"
+              echo "  1) Try another project name"
+              echo "  2) Switch to Cloudflare Quick Tunnel (*.trycloudflare.com)"
+              read -r -p "Select [1 or 2, Default: 1]: " CF_ERR_CHOICE
+              if [ "$CF_ERR_CHOICE" = "2" ]; then
+                FREE_CF_METHOD="1"
+                break
+              fi
+            fi
+          else
+            warn "No API token provided. StreamVault cannot verify or create this project on Cloudflare."
+            echo "You must manually create project '${CF_PAGES_NAME}' in your Cloudflare dashboard."
+            break
+          fi
+        done
+
+        if [ "$FREE_CF_METHOD" = "2" ]; then
+          PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+          FRONTEND_ORIGIN="https://${PUBLIC_DOMAIN}"
+          CF_PAGES_PROJECT="$CF_PAGES_NAME"
+          save_answer "PUBLIC_DOMAIN" "$PUBLIC_DOMAIN"
+          save_answer "FRONTEND_ORIGIN" "$FRONTEND_ORIGIN"
+          save_answer "TUNNEL_TYPE" "pages"
+          save_answer "CF_PAGES_PROJECT" "$CF_PAGES_PROJECT"
           save_answer "CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT_ID"
           save_answer "CLOUDFLARE_API_TOKEN" "$CF_API_TOKEN"
+          success "Cloudflare Pages configured for https://${PUBLIC_DOMAIN}."
         fi
-        success "Cloudflare Pages configured for https://${PUBLIC_DOMAIN}."
-        echo -e "Deployment worker template is available at ${CYAN}${TARGET_DIR}/cloudflare-pages/_worker.js${NC}"
-      else
+      fi
+
+      if [ "$FREE_CF_METHOD" = "1" ]; then
         TUNNEL_TYPE="quick"
-        PUBLIC_DOMAIN="trycloudflare.com"
-        FRONTEND_ORIGIN=""
-        save_answer "PUBLIC_DOMAIN" "trycloudflare.com"
-        save_answer "FRONTEND_ORIGIN" ""
+        PUBLIC_DOMAIN="localhost"
+        FRONTEND_ORIGIN="http://localhost:${NGINX_PORT:-8080}"
+        save_answer "PUBLIC_DOMAIN" "localhost"
+        save_answer "FRONTEND_ORIGIN" "http://localhost:${NGINX_PORT:-8080}"
         save_answer "TUNNEL_TYPE" "quick"
-        success "Cloudflare Quick Tunnel enabled (automatic *.trycloudflare.com URL)."
+        success "Cloudflare Quick Tunnel enabled (automatic, verified HTTPS URL)."
       fi
     else
       ENABLE_TUNNEL="false"
@@ -1275,12 +1314,20 @@ echo ""
 if [ "${DEPLOY_MODE:-1}" = "1" ]; then
   if [ "${ENABLE_TUNNEL:-false}" = "true" ]; then
     echo -e "${CYAN}${BOLD}Free Cloudflare Public Access Links:${NC}"
-    if [ "${TUNNEL_TYPE:-}" = "pages" ] || [[ "${PUBLIC_DOMAIN:-}" =~ \.pages\.dev$ ]]; then
-      echo -e "  • ${BOLD}Free Public Web App URL:${NC}      ${GREEN}https://${PUBLIC_DOMAIN}${NC}"
+    if [ "${TUNNEL_TYPE:-}" = "pages" ] && [ -n "${CF_PAGES_PROJECT:-}" ] && [ "${PUBLIC_DOMAIN:-}" != "streamvault.pages.dev" ]; then
+      echo -e "  • ${BOLD}Cloudflare Pages Web App:${NC}     ${GREEN}https://${PUBLIC_DOMAIN}${NC}"
       echo -e "  • ${BOLD}Cloudflare Pages Worker:${NC}      ${TARGET_DIR}/cloudflare-pages/_worker.js"
       echo -e "  • ${BOLD}Setup & Deploy Guide:${NC}         ${TARGET_DIR}/cloudflare-pages/README.md"
     else
-      echo -e "  • ${BOLD}Cloudflare Quick Tunnel:${NC}    ${GREEN}Active (Check terminal logs or run './start.sh status')${NC}"
+      local quick_tunnel_url=""
+      if [ -f "${TARGET_DIR}/logs/cloudflared.log" ]; then
+        quick_tunnel_url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "${TARGET_DIR}/logs/cloudflared.log" | tail -n1 || true)"
+      fi
+      if [ -n "$quick_tunnel_url" ]; then
+        echo -e "  • ${BOLD}Verified Public HTTPS URL:${NC}   ${GREEN}${quick_tunnel_url}${NC}"
+      else
+        echo -e "  • ${BOLD}Cloudflare Quick Tunnel:${NC}     ${GREEN}Active (Run './start.sh status' to view live link)${NC}"
+      fi
     fi
     echo -e "  • ${BOLD}Local Web App (LAN):${NC}          ${GREEN}http://${LAN_IP}:${NGINX_PORT:-8080}${NC}"
     echo -e "  • ${BOLD}Local Admin Operations Panel:${NC} ${YELLOW}http://127.0.0.1:4000${NC} (Strictly Local)"

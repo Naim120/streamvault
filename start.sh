@@ -182,13 +182,25 @@ show_status() {
   fi
 
   # 5. Cloudflare Tunnel
-  local cf_pid
-  cf_pid="$(pgrep -f "cloudflared.*tunnel" | head -n1 || true)"
+  local cf_pid=""
+  if [ -f "$DIR/.nginx/cloudflared.pid" ] && kill -0 "$(cat "$DIR/.nginx/cloudflared.pid" 2>/dev/null)" 2>/dev/null; then
+    cf_pid="$(cat "$DIR/.nginx/cloudflared.pid")"
+  elif pgrep -f "cloudflared.*8080" >/dev/null 2>&1; then
+    cf_pid="$(pgrep -f "cloudflared.*8080" | head -n1)"
+  fi
+
   if [ -n "$cf_pid" ]; then
     if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ] && [ "$PUBLIC_DOMAIN" != "trycloudflare.com" ] && [[ ! "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
       echo -e "  • Cloudflare Named Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> https://${PUBLIC_DOMAIN})"
     elif [[ "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
-      echo -e "  • Cloudflare Pages Gateway           : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> https://${PUBLIC_DOMAIN})"
+      local quick_origin
+      quick_origin="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/logs/cloudflared.log" 2>/dev/null | tail -n1 || true)"
+      if [ -n "$quick_origin" ]; then
+        echo -e "  • Cloudflare Pages Backend Tunnel    : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> ${quick_origin})"
+        echo -e "    └─ Configured Pages URL            : https://${PUBLIC_DOMAIN}"
+      else
+        echo -e "  • Cloudflare Pages Backend Tunnel    : ${GREEN}● RUNNING${NC} (PID: ${cf_pid})"
+      fi
     else
       local quick_url
       quick_url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/logs/cloudflared.log" 2>/dev/null | tail -n1 || true)"
@@ -223,7 +235,17 @@ stop_all_services() {
   pkill -f "streamvault-api" 2>/dev/null || true
   pkill -f "streamvault-admin" 2>/dev/null || true
   pkill -f "vite" 2>/dev/null || true
-  pkill -f "cloudflared.*tunnel" 2>/dev/null || true
+
+  # Only terminate StreamVault's own cloudflared processes on port 8080 or tracked via PID
+  if [ -f "$DIR/.nginx/cloudflared.pid" ]; then
+    local tracked_cf_pid
+    tracked_cf_pid="$(cat "$DIR/.nginx/cloudflared.pid" 2>/dev/null || true)"
+    if [ -n "$tracked_cf_pid" ] && kill -0 "$tracked_cf_pid" 2>/dev/null; then
+      kill "$tracked_cf_pid" 2>/dev/null || true
+    fi
+    rm -f "$DIR/.nginx/cloudflared.pid" 2>/dev/null || true
+  fi
+  pkill -f "cloudflared.*8080" 2>/dev/null || true
   pkill -x "aria2c" 2>/dev/null || true
 
   if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
@@ -541,7 +563,11 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
       TUNNEL_PID=$!
     else
       echo "Starting Free Cloudflare Tunnel to Nginx Gateway (http://127.0.0.1:8080)..."
-      pkill -f "cloudflared.*tunnel" 2>/dev/null || true
+      if [ -f "$DIR/.nginx/cloudflared.pid" ]; then
+        kill "$(cat "$DIR/.nginx/cloudflared.pid" 2>/dev/null)" 2>/dev/null || true
+        rm -f "$DIR/.nginx/cloudflared.pid"
+      fi
+      pkill -f "cloudflared.*8080" 2>/dev/null || true
       local cf_bin="cloudflared"
       if ! command -v cloudflared >/dev/null 2>&1 && [ -f "$DIR/cloudflared" ]; then
         cf_bin="$DIR/cloudflared"
@@ -554,6 +580,7 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
           "$cf_bin" tunnel --url http://127.0.0.1:8080 >> "$DIR/logs/cloudflared.log" 2>&1 &
         fi
         TUNNEL_PID=$!
+        echo "$TUNNEL_PID" > "$DIR/.nginx/cloudflared.pid"
       fi
 
       # Wait up to 6 seconds for tunnel origin URL to appear in logs
