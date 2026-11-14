@@ -3,9 +3,41 @@ import shutil
 import subprocess
 import psutil
 from typing import Dict, Any, List
+from pathlib import Path
 
 import platform
 import functools
+
+def get_media_storage_path() -> str:
+    """
+    Dynamically resolves the target storage path for media disk usage metrics:
+    1. Environment variable MEDIA_DIR (if set and exists)
+    2. settings.MEDIA_LIBRARY_DIR or settings.MEDIA_INCOMING_DIR
+    3. Project root / 'media'
+    4. Fallback to system root '/'
+    """
+    env_dir = os.environ.get("MEDIA_DIR", "").strip()
+    if env_dir and os.path.exists(env_dir):
+        return env_dir
+
+    try:
+        from .config import settings, BASE_DIR
+        if getattr(settings, "MEDIA_LIBRARY_DIR", None) and os.path.exists(settings.MEDIA_LIBRARY_DIR):
+            return str(Path(settings.MEDIA_LIBRARY_DIR).parent)
+        base_media = BASE_DIR / "media"
+        if base_media.exists():
+            return str(base_media)
+    except Exception:
+        pass
+
+    project_root = Path(__file__).resolve().parent.parent.parent
+    root_media = project_root / "media"
+    if root_media.exists():
+        return str(root_media)
+    if project_root.exists():
+        return str(project_root)
+
+    return "/"
 
 def get_os_metadata() -> Dict[str, str]:
     """
@@ -388,8 +420,7 @@ def get_static_hardware_info() -> Dict[str, Any]:
     cpu_cores = psutil.cpu_count(logical=True) or 1
     vm = psutil.virtual_memory()
     total_ram_gb = round(vm.total / (1024 ** 3), 2)
-    media_dir = os.environ.get("MEDIA_DIR") or "/home/ubuntu/streamvault/media"
-    disk_target = media_dir if os.path.exists(media_dir) else "/"
+    disk_target = get_media_storage_path()
     disk_info = psutil.disk_usage(disk_target)
     total_disk_gb = round(disk_info.total / (1024 ** 3), 2)
 
@@ -448,8 +479,7 @@ def get_system_capabilities() -> Dict[str, Any]:
     available_ram_gb = round(vm.available / (1024 ** 3), 2)
     ram_percent = vm.percent
 
-    media_dir = os.environ.get("MEDIA_DIR") or "/home/ubuntu/streamvault/media"
-    disk_target = media_dir if os.path.exists(media_dir) else "/"
+    disk_target = get_media_storage_path()
     disk_info = psutil.disk_usage(disk_target)
     free_disk_gb = round(disk_info.free / (1024 ** 3), 2)
     disk_percent = disk_info.percent
