@@ -86,11 +86,11 @@ prepare_nginx_conf() {
 
   if [ -f "$nginx_template" ]; then
     # Dynamically rewrite template directory paths and internal media server port ($DIR, $api_port)
-    sed \
+    sed -E \
       -e "s|/var/www/streamvault|$DIR|g" \
-      -e "s|/home/naim/netflix|$DIR|g" \
+      -e "s|/home/[^/]+/(netflix|streamvault)|$DIR|g" \
       -e "s|{{STREAMVAULT_DIR}}|$DIR|g" \
-      -e "s|http://127.0.0.1:[0-9]\+/|http://127.0.0.1:${api_port}/|g" \
+      -e "s|http://127.0.0.1:[0-9]+/|http://127.0.0.1:${api_port}/|g" \
       "$nginx_template" > "$nginx_runtime"
   fi
 

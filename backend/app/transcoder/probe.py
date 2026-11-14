@@ -1,10 +1,14 @@
+import asyncio
 import json
 import logging
 import subprocess
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
+
+# In-memory probe cache keyed by resolved file path -> (mtime, size_bytes, MediaProbeResult)
+_PROBE_CACHE: Dict[str, Tuple[float, int, 'MediaProbeResult']] = {}
 
 class MediaProbeResult:
     def __init__(self, raw: Dict[str, Any]):
@@ -79,11 +83,22 @@ class MediaProbeResult:
 def probe_file(file_path: str) -> Optional[MediaProbeResult]:
     """
     Executes ffprobe on input video file and returns a structured MediaProbeResult.
+    Caches results by (path, mtime, size) to eliminate redundant disk I/O and process spawns.
     """
     path = Path(file_path).resolve()
     if not path.is_file():
         logger.error(f"Cannot probe non-existent file: {file_path}")
         return None
+
+    try:
+        st = path.stat()
+        cache_key = str(path)
+        if cache_key in _PROBE_CACHE:
+            cached_mtime, cached_size, cached_probe = _PROBE_CACHE[cache_key]
+            if cached_mtime == st.st_mtime and cached_size == st.st_size:
+                return cached_probe
+    except Exception:
+        st = None
 
     cmd = [
         "ffprobe",
@@ -100,7 +115,21 @@ def probe_file(file_path: str) -> Optional[MediaProbeResult]:
             logger.error(f"ffprobe failed for {file_path}: {res.stderr}")
             return None
         data = json.loads(res.stdout)
-        return MediaProbeResult(data)
+        result = MediaProbeResult(data)
+        if st is not None:
+            try:
+                _PROBE_CACHE[str(path)] = (st.st_mtime, st.st_size, result)
+            except Exception:
+                pass
+        return result
     except Exception as e:
         logger.exception(f"Exception while running ffprobe on {file_path}: {e}")
         return None
+
+
+async def probe_file_async(file_path: str) -> Optional[MediaProbeResult]:
+    """
+    Asynchronously executes probe_file off the main asyncio event loop thread via asyncio.to_thread.
+    Prevents event-loop starvation when probing video files.
+    """
+    return await asyncio.to_thread(probe_file, file_path)

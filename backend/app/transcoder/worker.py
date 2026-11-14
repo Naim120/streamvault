@@ -3,7 +3,7 @@ import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from .probe import probe_file
+from .probe import probe_file, probe_file_async
 from .pipeline_remux import run_lossless_remux
 from .pipeline_transcode import run_multi_bitrate_transcode
 from ..config import settings
@@ -339,7 +339,7 @@ class TranscodeQueueManager:
             await self._update_stream_status(job, "processing")
 
             # 2. Probe file
-            probe = probe_file(str(input_path))
+            probe = await probe_file_async(str(input_path))
             if not probe:
                 raise ValueError("Could not inspect media streams using ffprobe")
 

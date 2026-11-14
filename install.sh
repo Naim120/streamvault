@@ -1431,7 +1431,7 @@ EOF
 
   # Ensure standalone nginx.conf is also synchronized with the target installation directory and API port
   if [ -f "${TARGET_DIR}/nginx.conf" ]; then
-    sed -i "s|/var/www/streamvault|${TARGET_DIR}|g; s|/home/naim/netflix|${TARGET_DIR}|g; s|http://127.0.0.1:[0-9]\+/|http://127.0.0.1:${API_PORT}/|g" "${TARGET_DIR}/nginx.conf" 2>/dev/null || true
+    sed -E -i "s|/var/www/streamvault|${TARGET_DIR}|g; s|/home/[^/]+/(netflix|streamvault)|${TARGET_DIR}|g; s|{{STREAMVAULT_DIR}}|${TARGET_DIR}|g; s|http://127.0.0.1:[0-9]+/|http://127.0.0.1:${API_PORT}/|g" "${TARGET_DIR}/nginx.conf" 2>/dev/null || true
   fi
 
   if [ -d /etc/nginx/conf.d ]; then

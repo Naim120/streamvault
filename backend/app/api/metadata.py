@@ -22,7 +22,7 @@ from ..transcoder.pipeline_remux import (
     build_smart_track_label,
     convert_subtitle_bytes_to_vtt
 )
-from ..transcoder.probe import probe_file
+from ..transcoder.probe import probe_file, probe_file_async
 from .stream import get_hls_playlist_duration, check_media_published
 import re
 from ..security import require_admin_secret
@@ -459,6 +459,14 @@ async def list_incoming_files():
     Lists all video files inside /media/incoming with intelligent filename parsing and catalog match status.
     Uses 1 bulk cached Supabase query (30s TTL) and matches filenames in memory to eliminate N+1 database queries.
     """
+    try:
+        return await _list_incoming_files_impl()
+    except Exception as e:
+        logger.exception(f"Unexpected error in list_incoming_files: {e}")
+        return []
+
+
+async def _list_incoming_files_impl():
     incoming = Path(settings.MEDIA_INCOMING_DIR)
     if not incoming.exists():
         return []
@@ -673,7 +681,7 @@ async def probe_incoming_file_stream(filename: str):
     if not target_file.is_relative_to(incoming.resolve()) or not target_file.is_file():
         raise HTTPException(status_code=404, detail=f"File '{filename}' not found in incoming directory")
 
-    probe = probe_file(str(target_file))
+    probe = await probe_file_async(str(target_file))
     if not probe:
         raise HTTPException(status_code=422, detail=f"Could not probe media streams from '{filename}'")
 

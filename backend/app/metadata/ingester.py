@@ -10,7 +10,7 @@ from ..database import db
 from ..config import settings
 from ..transcoder.worker import transcode_queue, TranscodeJob
 from ..transcoder.pipeline_remux import sanitize_track_label
-from ..transcoder.probe import probe_file
+from ..transcoder.probe import probe_file, probe_file_async
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ class MediaIngester:
         # Probe incoming file to extract exact duration_seconds and runtime_minutes immediately
         probe = None
         try:
-            probe = probe_file(file_path)
+            probe = await probe_file_async(file_path)
         except Exception as e:
             logger.warning(f"Could not probe file {file_path}: {e}")
         probe_seconds = int(round(probe.duration_seconds)) if probe and probe.duration_seconds > 0 else 0

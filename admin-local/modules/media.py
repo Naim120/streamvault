@@ -7,6 +7,7 @@ import httpx
 from .common import settings, MEDIA_SERVER_URL, ADMIN_SECRET
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 @router.get("/api/admin/incoming-files/{filename:path}/probe")
 async def probe_incoming_file_proxy(filename: str):
@@ -118,14 +119,17 @@ async def proxy_bulk_delete(payload: Dict[str, Any]):
 async def proxy_get_incoming_files():
     """Proxy route to Media Server to list incoming media files"""
     url = f"{MEDIA_SERVER_URL}/api/metadata/incoming-files"
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=15.0) as client:
         try:
             resp = await client.get(url, headers={"X-Admin-Secret": ADMIN_SECRET})
             if resp.status_code >= 400:
-                raise HTTPException(status_code=resp.status_code, detail=resp.text)
-            return resp.json()
+                logger.warning(f"Media server returned {resp.status_code} on incoming-files: {resp.text}")
+                return []
+            data = resp.json()
+            return data if isinstance(data, list) else []
         except httpx.RequestError as e:
-            raise HTTPException(status_code=502, detail=f"Failed to connect to Media Server: {e}")
+            logger.warning(f"Failed to connect to Media Server for incoming-files: {e}")
+            return []
 
 
 @router.post("/api/admin/auto-ingest")
@@ -720,11 +724,11 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
     let incomingPageSize = 10;
 
     function getDisplayFileList() {
-      let list = cachedIncomingFiles;
+      let list = Array.isArray(cachedIncomingFiles) ? cachedIncomingFiles : [];
       if (currentIncomingTab === 'pending') {
-        list = cachedIncomingFiles.filter(f => !f.is_published);
+        list = list.filter(f => !f.is_published);
       } else if (currentIncomingTab === 'published') {
-        list = cachedIncomingFiles.filter(f => f.is_published);
+        list = list.filter(f => f.is_published);
       }
 
       const query = (document.getElementById('incoming-search-input')?.value || '').trim().toLowerCase();
@@ -1664,19 +1668,41 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
 
     async function fetchIncomingFiles() {
       try {
-        const list = await fetch('/api/admin/incoming-files').then(r => r.json());
+        const res = await fetch('/api/admin/incoming-files');
+        if (!res.ok) {
+          console.warn(`Incoming files response status: ${res.status}`);
+          if (Array.isArray(cachedIncomingFiles) && cachedIncomingFiles.length > 0) {
+            renderIncomingFiles();
+            return;
+          }
+          throw new Error(`Server temporarily unavailable (${res.status})`);
+        }
+        const data = await res.json();
+        let list = [];
+        if (Array.isArray(data)) {
+          list = data;
+        } else if (data && Array.isArray(data.files)) {
+          list = data.files;
+        } else {
+          console.warn('Unexpected non-array data from incoming-files:', data);
+        }
 
-        cachedIncomingFiles = list || [];
+        cachedIncomingFiles = list;
 
-        const existingFilenames = new Set(cachedIncomingFiles.map(f => f.filename));
+        const existingFilenames = new Set((cachedIncomingFiles || []).map(f => f.filename));
         for (const fn of selectedIncoming) {
           if (!existingFilenames.has(fn)) selectedIncoming.delete(fn);
         }
 
         renderIncomingFiles();
       } catch (e) {
-        const cont = document.getElementById('incoming-files-list');
-        if (cont) cont.innerHTML = '<div class="text-red-400 py-1">Could not fetch incoming folder: ' + e.message + '</div>';
+        console.warn('fetchIncomingFiles error:', e);
+        if (!Array.isArray(cachedIncomingFiles) || cachedIncomingFiles.length === 0) {
+          const cont = document.getElementById('incoming-files-list');
+          if (cont) cont.innerHTML = '<div class="text-red-400 py-1">Could not fetch incoming folder: ' + escapeHtml(e.message) + '</div>';
+        } else {
+          renderIncomingFiles();
+        }
       }
     }
 
@@ -1693,6 +1719,7 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
       const cont = document.getElementById('incoming-files-list');
       if (!cont) return;
 
+      if (!Array.isArray(cachedIncomingFiles)) cachedIncomingFiles = [];
       const pendingFiles = cachedIncomingFiles.filter(f => !f.is_published);
       const publishedFiles = cachedIncomingFiles.filter(f => f.is_published);
 
@@ -1953,90 +1980,97 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
       }
 
       try {
-        const probedItems = await Promise.all(filenames.map(async (filename, itemIdx) => {
-          try {
-            const res = await fetch(`/api/admin/incoming-files/${encodeURIComponent(filename)}/probe`);
-            if (!res.ok) {
-              const err = await res.json().catch(() => ({ detail: 'Failed to probe file' }));
-              throw new Error(err.detail || 'Probe failed');
-            }
-            const data = await res.json();
-            const embedded_audio = (data.embedded_audio || []).map((a, aIdx) => ({
-              raw_stream_idx: a.raw_stream_idx,
-              codec: a.codec || 'aac',
-              channels: a.channels || 2,
-              lang: a.lang || 'en',
-              raw_title: a.raw_title || '',
-              clean_label: cleanTrackWatermarks(a.clean_label || `Audio ${a.raw_stream_idx}`),
-              is_default: Boolean(a.is_default),
-              included: a.included !== false
-            }));
+        const probedItems = [];
+        const concurrency = 2;
+        for (let c = 0; c < filenames.length; c += concurrency) {
+          const chunk = filenames.slice(c, c + concurrency);
+          const chunkRes = await Promise.all(chunk.map(async (filename, idxInChunk) => {
+            const itemIdx = c + idxInChunk;
+            try {
+              const res = await fetch(`/api/admin/incoming-files/${encodeURIComponent(filename)}/probe`);
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({ detail: 'Failed to probe file' }));
+                throw new Error(err.detail || 'Probe failed');
+              }
+              const data = await res.json();
+              const embedded_audio = (data.embedded_audio || []).map((a, aIdx) => ({
+                raw_stream_idx: a.raw_stream_idx,
+                codec: a.codec || 'aac',
+                channels: a.channels || 2,
+                lang: a.lang || 'en',
+                raw_title: a.raw_title || '',
+                clean_label: cleanTrackWatermarks(a.clean_label || `Audio ${a.raw_stream_idx}`),
+                is_default: Boolean(a.is_default),
+                included: a.included !== false
+              }));
 
-            // Ensure at least one audio track is default
-            if (embedded_audio.length > 0 && !embedded_audio.some(a => a.is_default && a.included)) {
-              embedded_audio[0].is_default = true;
-              embedded_audio[0].included = true;
-            }
+              // Ensure at least one audio track is default
+              if (embedded_audio.length > 0 && !embedded_audio.some(a => a.is_default && a.included)) {
+                embedded_audio[0].is_default = true;
+                embedded_audio[0].included = true;
+              }
 
-            const initialContainerSubs = (data.embedded_subtitles || []).map(s => ({
-              id: `stream_${s.raw_stream_idx}`,
-              raw_stream_idx: s.raw_stream_idx,
-              codec: s.codec || 'subrip',
-              lang: s.lang || 'en',
-              raw_title: s.raw_title || '',
-              label: cleanTrackWatermarks(s.clean_label || `Subtitle ${s.raw_stream_idx}`),
-              source_type: 'container',
-              source_badge: `STREAM #${s.raw_stream_idx} (${(s.codec || 'SRT').toUpperCase()})`,
-              included: true
-            }));
-
-            let subtitles = [];
-            if (Array.isArray(data.subtitles)) {
-              subtitles = data.subtitles.map((s, sIdx) => ({
-                id: s.id || `sub_${sIdx}`,
-                raw_stream_idx: s.raw_stream_idx !== undefined ? s.raw_stream_idx : -1,
+              const initialContainerSubs = (data.embedded_subtitles || []).map(s => ({
+                id: `stream_${s.raw_stream_idx}`,
+                raw_stream_idx: s.raw_stream_idx,
                 codec: s.codec || 'subrip',
                 lang: s.lang || 'en',
                 raw_title: s.raw_title || '',
-                label: cleanTrackWatermarks(s.label || `Subtitle ${sIdx + 1}`),
-                vtt_path: s.vtt_path,
-                path: s.path,
-                filename: s.filename,
-                source_type: s.source_type || 'container',
-                source_badge: s.source_badge || 'SUBTITLE',
-                ext_id: s.ext_id,
+                label: cleanTrackWatermarks(s.clean_label || `Subtitle ${s.raw_stream_idx}`),
+                source_type: 'container',
+                source_badge: `STREAM #${s.raw_stream_idx} (${(s.codec || 'SRT').toUpperCase()})`,
                 included: true
               }));
-            } else if (!data.is_reingest) {
-              subtitles = initialContainerSubs.map(s => ({ ...s }));
-            } else {
-              subtitles = [];
-            }
 
-            return {
-              itemIdx,
-              filename: data.filename || filename,
-              display_title: data.display_title || filename,
-              is_reingest: Boolean(data.is_reingest),
-              video_info: data.video_info || {},
-              embedded_audio,
-              initialContainerSubs,
-              subtitles
-            };
-          } catch (e) {
-            return {
-              itemIdx,
-              filename,
-              error: e.message,
-              display_title: filename,
-              is_reingest: false,
-              video_info: {},
-              embedded_audio: [],
-              initialContainerSubs: [],
-              subtitles: []
-            };
-          }
-        }));
+              let subtitles = [];
+              if (Array.isArray(data.subtitles)) {
+                subtitles = data.subtitles.map((s, sIdx) => ({
+                  id: s.id || `sub_${sIdx}`,
+                  raw_stream_idx: s.raw_stream_idx !== undefined ? s.raw_stream_idx : -1,
+                  codec: s.codec || 'subrip',
+                  lang: s.lang || 'en',
+                  raw_title: s.raw_title || '',
+                  label: cleanTrackWatermarks(s.label || `Subtitle ${sIdx + 1}`),
+                  vtt_path: s.vtt_path,
+                  path: s.path,
+                  filename: s.filename,
+                  source_type: s.source_type || 'container',
+                  source_badge: s.source_badge || 'SUBTITLE',
+                  ext_id: s.ext_id,
+                  included: true
+                }));
+              } else if (!data.is_reingest) {
+                subtitles = initialContainerSubs.map(s => ({ ...s }));
+              } else {
+                subtitles = [];
+              }
+
+              return {
+                itemIdx,
+                filename: data.filename || filename,
+                display_title: data.display_title || filename,
+                is_reingest: Boolean(data.is_reingest),
+                video_info: data.video_info || {},
+                embedded_audio,
+                initialContainerSubs,
+                subtitles
+              };
+            } catch (e) {
+              return {
+                itemIdx,
+                filename,
+                error: e.message,
+                display_title: filename,
+                is_reingest: false,
+                video_info: {},
+                embedded_audio: [],
+                initialContainerSubs: [],
+                subtitles: []
+              };
+            }
+          }));
+          probedItems.push(...chunkRes);
+        }
 
         ingestModalItems = probedItems;
 
