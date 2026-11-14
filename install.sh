@@ -1329,7 +1329,7 @@ if [ "${DEPLOY_MODE:-1}" = "1" ]; then
       echo -e "  • ${BOLD}Cloudflare Pages Worker:${NC}      ${TARGET_DIR}/cloudflare-pages/_worker.js"
       echo -e "  • ${BOLD}Setup & Deploy Guide:${NC}         ${TARGET_DIR}/cloudflare-pages/README.md"
     else
-      local quick_tunnel_url=""
+      quick_tunnel_url=""
       if [ -f "${TARGET_DIR}/logs/cloudflared.log" ]; then
         quick_tunnel_url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "${TARGET_DIR}/logs/cloudflared.log" | tail -n1 || true)"
       fi

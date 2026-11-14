@@ -67,6 +67,16 @@ export default {
       const response = await fetch(proxyRequest);
       const responseHeaders = new Headers(response.headers);
 
+      // Ensure redirect Location headers stay on the Pages domain instead of leaking the tunnel origin
+      const locationHeader = responseHeaders.get("Location");
+      if (locationHeader) {
+        try {
+          const locUrl = new URL(locationHeader, targetOrigin);
+          const rewrittenLoc = new URL(locUrl.pathname + locUrl.search + locUrl.hash, url.origin);
+          responseHeaders.set("Location", rewrittenLoc.toString());
+        } catch (_) {}
+      }
+
       // Ensure proper CORS and security headers pass through
       return new Response(response.body, {
         status: response.status,

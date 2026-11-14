@@ -595,7 +595,10 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
       # If Cloudflare Pages project is configured, update backend tunnel origin
       if [ -n "$TUNNEL_URL" ]; then
         if [ -f "$DIR/cloudflare-pages/_worker.js" ]; then
-          sed -i "s|__TUNNEL_ORIGIN_PLACEHOLDER__|${TUNNEL_URL}|g" "$DIR/cloudflare-pages/_worker.js" 2>/dev/null || true
+          sed -i -E "s|targetOrigin = \(env\.BACKEND_TUNNEL_URL \|\| [^)]+\)|targetOrigin = (env.BACKEND_TUNNEL_URL \|\| \"${TUNNEL_URL}\")|g" "$DIR/cloudflare-pages/_worker.js" 2>/dev/null || true
+          if [ -d "$DIR/frontend/dist" ]; then
+            cp "$DIR/cloudflare-pages/_worker.js" "$DIR/frontend/dist/_worker.js" 2>/dev/null || true
+          fi
         fi
         if [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CF_PAGES_PROJECT:-}" ]; then
           echo "Syncing active tunnel to Cloudflare Pages (${CF_PAGES_PROJECT})..."
@@ -603,6 +606,15 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
             -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
             -H "Content-Type: application/json" \
             -d "{\"deployment_configs\":{\"production\":{\"env_vars\":{\"BACKEND_TUNNEL_URL\":{\"value\":\"${TUNNEL_URL}\"}}}}}" >/dev/null 2>&1 || true
+
+          if [ -d "$DIR/frontend/dist" ] && command -v npx >/dev/null 2>&1; then
+            echo "Deploying updated gateway to Cloudflare Pages in background..."
+            (
+              CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" \
+              CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
+              npx wrangler@3 pages deploy "$DIR/frontend/dist" --project-name="$CF_PAGES_PROJECT" --branch=main --commit-dirty=true >/dev/null 2>&1
+            ) &
+          fi
         fi
       fi
     fi
