@@ -834,6 +834,149 @@ EOF
     ( umask 077 && touch "${TARGET_DIR}/frontend/.env" && chmod 600 "${TARGET_DIR}/frontend/.env" )
     grep -E '^VITE_' "$ENV_FILE" > "${TARGET_DIR}/frontend/.env" || true
   fi
+
+  # --- Supabase Database Schema Setup (Automate vs Manual) ---
+  SUPABASE_URL_VAL="$(grep '^SUPABASE_URL=' "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)"
+  SUPABASE_SRK_VAL="$(grep '^SUPABASE_SERVICE_ROLE_KEY=' "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)"
+  PROJECT_REF_VAL="$(echo "$SUPABASE_URL_VAL" | sed -E 's|https?://([^.]+)\.supabase\.co.*|\1|')"
+
+  if [ -n "$PROJECT_REF_VAL" ] && [ "$PROJECT_REF_VAL" != "localhost" ]; then
+    echo ""
+    echo -e "${BOLD}--- Supabase Database Schema Initialization (setup.sql) ---${NC}"
+    echo "StreamVault requires core tables (system_settings, media_items, profiles, episodes),"
+    echo "indexes, triggers, and RPC security functions in your Supabase project."
+    echo ""
+
+    schema_already_verified="false"
+    if [ -n "$SUPABASE_SRK_VAL" ]; then
+      verify_status="$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: ${SUPABASE_SRK_VAL}" -H "Authorization: Bearer ${SUPABASE_SRK_VAL}" "${SUPABASE_URL_VAL}/rest/v1/system_settings?select=id&limit=1" 2>/dev/null || echo "000")"
+      if [ "$verify_status" = "200" ]; then
+        schema_already_verified="true"
+        success "Supabase database schema is already initialized and verified!"
+      fi
+    fi
+
+    if [ "$schema_already_verified" != "true" ]; then
+      schema_mode=""
+      while [ "$schema_mode" != "done" ]; do
+        echo "How would you like to initialize your database schema?"
+        echo "  1) Automate (StreamVault runs setup.sql using your Database Password)"
+        echo "  2) Manually execute in the Supabase Dashboard SQL Editor"
+        read -r -p "Select option [1 or 2, Default: 1]: " CHOSEN_SCHEMA_MODE
+        CHOSEN_SCHEMA_MODE="${CHOSEN_SCHEMA_MODE:-1}"
+
+        if [ "$CHOSEN_SCHEMA_MODE" = "1" ]; then
+          # --- AUTOMATE FLOW ---
+          echo ""
+          echo -e "${CYAN}--- Automated Database Schema Execution ---${NC}"
+          echo "Enter your Supabase Database Password (set when you created the project),"
+          echo "or your full PostgreSQL Connection String, or Personal Access Token (sbp_...):"
+          read -r -s -p "Database Password / URI / Token: " DB_CREDENTIAL
+          echo ""
+
+          if [ -z "$DB_CREDENTIAL" ]; then
+            warn "No password or token entered. Returning to selection."
+            continue
+          fi
+
+          info "Preparing Python environment to execute schema..."
+          ACTIVE_VENV="${TARGET_DIR}/.venv"
+          if [ ! -d "$ACTIVE_VENV" ] && [ -d "${TARGET_DIR}/backend/venv" ]; then
+            ACTIVE_VENV="${TARGET_DIR}/backend/venv"
+          elif [ ! -d "$ACTIVE_VENV" ]; then
+            python3 -m venv "$ACTIVE_VENV" 2>/dev/null || true
+          fi
+          if [ -d "$ACTIVE_VENV" ]; then
+            "$ACTIVE_VENV/bin/pip" install pg8000 httpx -q 2>/dev/null || true
+            PY_BIN="$ACTIVE_VENV/bin/python3"
+          else
+            PY_BIN="python3"
+          fi
+
+          info "Executing setup.sql on Supabase project '${PROJECT_REF_VAL}'..."
+          if "$PY_BIN" "${TARGET_DIR}/supabase/apply_schema.py" \
+               --url "$SUPABASE_URL_VAL" \
+               --password "$DB_CREDENTIAL" \
+               --sql-file "${TARGET_DIR}/supabase/setup.sql" \
+               --apikey "$SUPABASE_SRK_VAL"; then
+            success "Supabase database schema initialized successfully!"
+            schema_mode="done"
+          else
+            warn "Automated schema execution could not complete."
+            echo ""
+            echo "What would you like to do?"
+            echo "  1) Try automated execution again"
+            echo "  2) Switch to manual execution guide"
+            echo "  3) Skip for now and continue installation"
+            read -r -p "Select [1, 2, or 3, Default: 2]: " RETRY_ACTION
+            RETRY_ACTION="${RETRY_ACTION:-2}"
+            if [ "$RETRY_ACTION" = "2" ]; then
+              CHOSEN_SCHEMA_MODE="2"
+            elif [ "$RETRY_ACTION" = "3" ]; then
+              schema_mode="done"
+            fi
+          fi
+        fi
+
+        if [ "$CHOSEN_SCHEMA_MODE" = "2" ]; then
+          # --- MANUAL EXECUTION GUIDE ---
+          manual_done="false"
+          while [ "$manual_done" != "true" ]; do
+            echo ""
+            echo -e "${BOLD}==============================================================================${NC}"
+            echo -e "${BOLD}              MANUAL SUPABASE SCHEMA INITIALIZATION GUIDE                    ${NC}"
+            echo -e "${BOLD}==============================================================================${NC}"
+            echo "Follow these 3 simple steps to create your database tables:"
+            echo ""
+            echo -e "  ${BOLD}1.${NC} Open the Supabase SQL Editor in your browser:"
+            echo -e "     👉 ${CYAN}https://supabase.com/dashboard/project/${PROJECT_REF_VAL}/sql/new${NC}"
+            echo ""
+            echo -e "  ${BOLD}2.${NC} The master SQL schema file is located on this server at:"
+            echo -e "     📄 ${YELLOW}${TARGET_DIR}/supabase/setup.sql${NC}"
+            echo ""
+            echo -e "  ${BOLD}3.${NC} Copy the entire contents of setup.sql, paste it into the SQL Editor,"
+            echo -e "     and click ${BOLD}'Run'${NC} (or press Ctrl+Enter / Cmd+Enter)."
+            echo -e "${BOLD}==============================================================================${NC}"
+            echo ""
+            echo "What would you like to do?"
+            echo "  1) I have executed successfully (Verify & proceed)"
+            echo "  2) Change to automate (Run automatically with DB password)"
+            read -r -p "Select option [1 or 2, Default: 1]: " MANUAL_CHOICE
+            MANUAL_CHOICE="${MANUAL_CHOICE:-1}"
+
+            if [ "$MANUAL_CHOICE" = "1" ]; then
+              info "Verifying database tables in Supabase schema cache..."
+              verify_status="$(curl -s -o /dev/null -w "%{http_code}" -H "apikey: ${SUPABASE_SRK_VAL}" -H "Authorization: Bearer ${SUPABASE_SRK_VAL}" "${SUPABASE_URL_VAL}/rest/v1/system_settings?select=id&limit=1" 2>/dev/null || echo "000")"
+              if [ "$verify_status" = "200" ]; then
+                success "Verified! Supabase database tables (system_settings, etc.) are active!"
+                manual_done="true"
+                schema_mode="done"
+              else
+                warn "Tables were not detected yet in the Supabase schema cache (HTTP ${verify_status})."
+                echo "If you just clicked 'Run', Supabase PostgREST might take 5-10 seconds to reload its schema cache."
+                echo ""
+                echo "  1) Re-check verification"
+                echo "  2) Change to automate"
+                echo "  3) I am sure it succeeded, continue installation anyway"
+                read -r -p "Select [1, 2, or 3, Default: 1]: " REVERIFY_CHOICE
+                REVERIFY_CHOICE="${REVERIFY_CHOICE:-1}"
+                if [ "$REVERIFY_CHOICE" = "2" ]; then
+                  manual_done="true"
+                  CHOSEN_SCHEMA_MODE="1"
+                elif [ "$REVERIFY_CHOICE" = "3" ]; then
+                  manual_done="true"
+                  schema_mode="done"
+                fi
+              fi
+            elif [ "$MANUAL_CHOICE" = "2" ]; then
+              manual_done="true"
+              CHOSEN_SCHEMA_MODE="1"
+            fi
+          done
+        fi
+      done
+    fi
+  fi
   echo ""
 fi
 
