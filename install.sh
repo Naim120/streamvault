@@ -985,7 +985,12 @@ fi
 # Launch Services
 if [ -f "${TARGET_DIR}/start.sh" ]; then
   chmod +x "${TARGET_DIR}/start.sh"
-  "${TARGET_DIR}/start.sh" restart
+  info "Launching StreamVault services..."
+  if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled streamvault.service >/dev/null 2>&1; then
+    $SUDO systemctl restart streamvault.service || "${TARGET_DIR}/start.sh" boot
+  else
+    "${TARGET_DIR}/start.sh" boot
+  fi
 fi
 
 # Clean up checkpoints on successful completion

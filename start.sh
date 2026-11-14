@@ -390,10 +390,44 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   echo "Starting Nginx single-origin gateway on port 8080..."
   prepare_nginx_conf
   conf_file="$(get_nginx_conf)"
-  if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
-    nginx -c "$conf_file" -s reload
+
+  # Detect if port 8080 is already active
+  port_8080_pid=""
+  if command -v lsof >/dev/null 2>&1; then
+    port_8080_pid="$(lsof -i :8080 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
+  fi
+  if [ -z "$port_8080_pid" ] && command -v fuser >/dev/null 2>&1; then
+    port_8080_pid="$(fuser 8080/tcp 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  if [ -z "$port_8080_pid" ] && command -v ss >/dev/null 2>&1; then
+    port_8080_pid="$(ss -lptn 'sport = :8080' 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -n1 || true)"
+  fi
+
+  if [ -n "$port_8080_pid" ]; then
+    port_proc="$(ps -p "$port_8080_pid" -o comm= 2>/dev/null || true)"
+    if [[ "$port_proc" =~ nginx ]]; then
+      echo -e "${GREEN}[ ✓ ] Nginx single-origin gateway is already listening on port 8080 (PID: ${port_8080_pid}).${NC}"
+      if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
+        nginx -c "$conf_file" -s reload 2>/dev/null || true
+      elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+        $SUDO systemctl reload nginx 2>/dev/null || true
+      else
+        nginx -s reload 2>/dev/null || true
+      fi
+    else
+      echo -e "${RED}[ ✗ ] Port 8080 is already occupied by process '${port_proc}' (PID: ${port_8080_pid}).${NC}"
+      echo -e "${YELLOW}Cannot start Nginx gateway on port 8080. Please stop the conflicting process.${NC}"
+      exit 1
+    fi
   else
-    nginx -c "$conf_file"
+    # Port 8080 is free, launch standalone Nginx or start system Nginx
+    if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
+      nginx -c "$conf_file" -s reload
+    elif command -v systemctl >/dev/null 2>&1 && [ -f /etc/nginx/conf.d/streamvault.conf ]; then
+      $SUDO systemctl restart nginx 2>/dev/null || nginx -c "$conf_file"
+    else
+      nginx -c "$conf_file"
+    fi
   fi
 
   # Check for authenticated Named Tunnel from install.sh
