@@ -65,6 +65,10 @@ save_answer() {
 
 handle_interrupt() {
   local exit_code=$?
+  # If installation is already marked complete, exit cleanly without error
+  if [ -f "$COMPLETE_FILE" ]; then
+    exit 0
+  fi
   echo ""
   warn "Signal or error encountered during installation."
   # Terminate active background child jobs
@@ -153,8 +157,10 @@ check_existing_app() {
         info "Restarting active StreamVault services..."
         ./start.sh restart
         touch "$COMPLETE_FILE"
+        trap - SIGINT SIGTERM ERR EXIT
+        disown -a 2>/dev/null || true
         echo ""
-        success "StreamVault successfully updated and running!"
+        success "StreamVault successfully updated and running in background!"
         exit 0
         ;;
       2)
@@ -1066,15 +1072,18 @@ if [ -f "${TARGET_DIR}/start.sh" ]; then
   chmod +x "${TARGET_DIR}/start.sh"
   info "Launching StreamVault services..."
   if command -v systemctl >/dev/null 2>&1 && systemctl is-enabled streamvault.service >/dev/null 2>&1; then
-    $SUDO systemctl restart streamvault.service || "${TARGET_DIR}/start.sh" boot
+    $SUDO systemctl restart streamvault.service || "${TARGET_DIR}/start.sh" start
   else
-    "${TARGET_DIR}/start.sh" boot
+    "${TARGET_DIR}/start.sh" start
   fi
 fi
 
 # Clean up checkpoints on successful completion
 rm -f "$CHECKPOINT_FILE" "$ANSWERS_FILE"
 touch "$COMPLETE_FILE"
+
+# Disarm trap handler so viewing links or pressing Ctrl+C never prints interrupted
+trap - SIGINT SIGTERM ERR EXIT
 
 LAN_IP="$(hostname -I 2>/dev/null | awk '{print $1}' || ipconfig getifaddr en0 2>/dev/null || echo '127.0.0.1')"
 
@@ -1127,3 +1136,14 @@ else
   echo -e "  • ${GREEN}https://${PUBLIC_DOMAIN}/**${NC}"
 fi
 echo "=============================================================================="
+echo ""
+echo -e "${GREEN}${BOLD}✓ StreamVault is detached and running in the background.${NC}"
+echo -e "You can manage services anytime using:"
+echo -e "  • Check Status : ${BOLD}./start.sh status${NC}"
+echo -e "  • View Logs    : ${BOLD}./start.sh logs${NC}"
+echo -e "  • Stop App     : ${BOLD}./start.sh stop${NC}"
+echo -e "  • Restart App  : ${BOLD}./start.sh restart${NC}"
+echo ""
+
+disown -a 2>/dev/null || true
+exit 0

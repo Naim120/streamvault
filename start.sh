@@ -51,7 +51,7 @@ fi
 # Privilege Helper for systemd
 SUDO=""
 if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
-  SUDO="sudo"
+  SUDO="sudo -n"
 fi
 
 # Detect Python Uvicorn runner
@@ -146,6 +146,11 @@ show_status() {
   # 3. Nginx Single-Origin Gateway (:8080)
   local nginx_pid
   nginx_pid="$(lsof -ti :8080 2>/dev/null | head -n1 || true)"
+  [ -z "$nginx_pid" ] && [ -f "$DIR/.nginx/nginx.pid" ] && nginx_pid="$(cat "$DIR/.nginx/nginx.pid" 2>/dev/null || true)"
+  [ -z "$nginx_pid" ] && command -v pgrep >/dev/null 2>&1 && nginx_pid="$(pgrep -f "nginx: master" | head -n1 || pgrep -x nginx | head -n1 || true)"
+  if [ -z "$nginx_pid" ] && (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+    nginx_pid="Active (Port 8080)"
+  fi
   if [ -n "$nginx_pid" ]; then
     echo -e "  • Nginx Single-Origin    [Port 8080] : ${GREEN}● RUNNING${NC} (PID: ${nginx_pid})"
   else
@@ -265,12 +270,27 @@ EOF
   exit 0
 }
 
-# Parse Command Mode
+# Parse Command Mode & Execution Options
 MODE="${1:-}"
+DAEMON_MODE="true"
+
+# Check for explicit foreground / background flags
+for arg in "$@"; do
+  if [ "$arg" = "-f" ] || [ "$arg" = "--foreground" ]; then
+    DAEMON_MODE="false"
+  elif [ "$arg" = "-d" ] || [ "$arg" = "--daemon" ]; then
+    DAEMON_MODE="true"
+  fi
+done
 
 case "$MODE" in
   status)
     show_status
+    ;;
+  logs)
+    echo -e "${CYAN}Streaming live StreamVault logs (Ctrl+C to exit)...${NC}"
+    tail -n 50 -f "$DIR/logs/"*.log 2>/dev/null || tail -n 50 -f "$DIR/logs/media_server.log" "$DIR/logs/admin.log" 2>/dev/null
+    exit 0
     ;;
   stop)
     stop_all_services
@@ -307,14 +327,23 @@ case "$MODE" in
     fi
     MODE="${LAST_MODE:-prod}"
     ;;
-  prod|tunnel|dev|"")
-    MODE="${MODE:-${LAST_MODE:-dev}}"
+  dev)
+    MODE="dev"
+    DESIRED_STATE="ACTIVE"
+    LAST_MODE="dev"
+    save_state
+    if [ "$2" != "-d" ] && [ "$2" != "--daemon" ]; then
+      DAEMON_MODE="false"
+    fi
+    ;;
+  prod|tunnel|"")
+    MODE="${MODE:-${LAST_MODE:-prod}}"
     DESIRED_STATE="ACTIVE"
     LAST_MODE="$MODE"
     save_state
     ;;
   *)
-    echo "Usage: ./start.sh [prod|dev|tunnel|start|stop|restart|status|autostart on/off]"
+    echo "Usage: ./start.sh [prod|dev|tunnel|start|stop|restart|status|logs|autostart on/off]"
     exit 1
     ;;
 esac
@@ -360,7 +389,7 @@ fi
 echo "[2/4] Starting FastAPI Media Server on port 8000..."
 cd "$DIR/backend"
 API_HOST="127.0.0.1"
-if [ "$1" = "boot" ]; then
+if [ "$DAEMON_MODE" = "true" ]; then
   setsid nohup "$UVICORN" app.main:app --host "$API_HOST" --port 8000 < /dev/null >> "$DIR/logs/media_server.log" 2>&1 &
 else
   "$UVICORN" app.main:app --host "$API_HOST" --port 8000 >> "$DIR/logs/media_server.log" 2>&1 &
@@ -380,7 +409,7 @@ if [ -f "$DIR/frontend/node_modules/.bin/tailwindcss" ] && [ -f "$DIR/admin-loca
   fi
 fi
 
-if [ "$1" = "boot" ]; then
+if [ "$DAEMON_MODE" = "true" ]; then
   setsid nohup "$UVICORN" admin-local.server:app --host 127.0.0.1 --port 4000 < /dev/null >> "$DIR/logs/admin.log" 2>&1 &
 else
   "$UVICORN" admin-local.server:app --host 127.0.0.1 --port 4000 >> "$DIR/logs/admin.log" 2>&1 &
@@ -400,30 +429,41 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   conf_file="$(get_nginx_conf)"
 
   # Detect if port 8080 is already active
-  port_8080_pid=""
-  if command -v lsof >/dev/null 2>&1; then
-    port_8080_pid="$(lsof -i :8080 -sTCP:LISTEN -t 2>/dev/null | head -n1 || true)"
-  fi
-  if [ -z "$port_8080_pid" ] && command -v fuser >/dev/null 2>&1; then
-    port_8080_pid="$(fuser 8080/tcp 2>/dev/null | awk '{print $1}' || true)"
-  fi
-  if [ -z "$port_8080_pid" ] && command -v ss >/dev/null 2>&1; then
-    port_8080_pid="$(ss -lptn 'sport = :8080' 2>/dev/null | grep -oP 'pid=\K[0-9]+' | head -n1 || true)"
+  port_8080_in_use="false"
+  if (echo > /dev/tcp/127.0.0.1/8080) 2>/dev/null; then
+    port_8080_in_use="true"
+  elif command -v ss >/dev/null 2>&1 && ss -ltn "( sport = :8080 )" 2>/dev/null | grep -q 8080; then
+    port_8080_in_use="true"
+  elif command -v lsof >/dev/null 2>&1 && lsof -i :8080 -sTCP:LISTEN >/dev/null 2>&1; then
+    port_8080_in_use="true"
+  elif command -v fuser >/dev/null 2>&1 && fuser 8080/tcp >/dev/null 2>&1; then
+    port_8080_in_use="true"
   fi
 
-  if [ -n "$port_8080_pid" ]; then
-    port_proc="$(ps -p "$port_8080_pid" -o comm= 2>/dev/null || true)"
-    if [[ "$port_proc" =~ nginx ]]; then
-      echo -e "${GREEN}[ ✓ ] Nginx single-origin gateway is already listening on port 8080 (PID: ${port_8080_pid}).${NC}"
+  if [ "$port_8080_in_use" = "true" ]; then
+    # Check if the process listening on port 8080 is Nginx
+    is_nginx="false"
+    if command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
+      is_nginx="true"
+    elif [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
+      is_nginx="true"
+    elif curl -sI http://127.0.0.1:8080 2>/dev/null | grep -iq "server: nginx"; then
+      is_nginx="true"
+    elif pgrep -x nginx >/dev/null 2>&1; then
+      is_nginx="true"
+    fi
+
+    if [ "$is_nginx" = "true" ]; then
+      echo -e "${GREEN}[ ✓ ] Nginx single-origin gateway is already listening on port 8080.${NC}"
       if [ -f "$DIR/.nginx/nginx.pid" ] && kill -0 "$(cat "$DIR/.nginx/nginx.pid")" 2>/dev/null; then
         nginx -c "$conf_file" -s reload 2>/dev/null || true
       elif command -v systemctl >/dev/null 2>&1 && systemctl is-active --quiet nginx 2>/dev/null; then
-        $SUDO systemctl reload nginx 2>/dev/null || true
+        $SUDO systemctl reload nginx 2>/dev/null || nginx -s reload 2>/dev/null || true
       else
-        nginx -s reload 2>/dev/null || true
+        $SUDO nginx -s reload 2>/dev/null || nginx -s reload 2>/dev/null || true
       fi
     else
-      echo -e "${RED}[ ✗ ] Port 8080 is already occupied by process '${port_proc}' (PID: ${port_8080_pid}).${NC}"
+      echo -e "${RED}[ ✗ ] Port 8080 is already occupied by a non-Nginx process.${NC}"
       echo -e "${YELLOW}Cannot start Nginx gateway on port 8080. Please stop the conflicting process.${NC}"
       exit 1
     fi
@@ -454,16 +494,26 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
     if [ "$HAS_NAMED_TUNNEL" = "true" ]; then
       echo "Starting Authenticated Cloudflare Named Tunnel (https://${PUBLIC_DOMAIN})..."
       pkill -f "cloudflared.*tunnel.*run" 2>/dev/null || true
-      cloudflared --config "$HOME/.cloudflared/config.yml" tunnel run > "$DIR/logs/cloudflared.log" 2>&1 &
+      if [ "$DAEMON_MODE" = "true" ]; then
+        setsid nohup cloudflared --config "$HOME/.cloudflared/config.yml" tunnel run < /dev/null >> "$DIR/logs/cloudflared.log" 2>&1 &
+      else
+        cloudflared --config "$HOME/.cloudflared/config.yml" tunnel run >> "$DIR/logs/cloudflared.log" 2>&1 &
+      fi
       TUNNEL_PID=$!
     else
       echo "Starting Free Cloudflare Tunnel to Nginx Gateway (http://127.0.0.1:8080)..."
       pkill -f "cloudflared.*tunnel" 2>/dev/null || true
-      if command -v cloudflared >/dev/null 2>&1; then
-        cloudflared tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
-        TUNNEL_PID=$!
-      elif [ -f "$DIR/cloudflared" ]; then
-        "$DIR/cloudflared" tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
+      local cf_bin="cloudflared"
+      if ! command -v cloudflared >/dev/null 2>&1 && [ -f "$DIR/cloudflared" ]; then
+        cf_bin="$DIR/cloudflared"
+      fi
+
+      if command -v cloudflared >/dev/null 2>&1 || [ -f "$DIR/cloudflared" ]; then
+        if [ "$DAEMON_MODE" = "true" ]; then
+          setsid nohup "$cf_bin" tunnel --url http://127.0.0.1:8080 < /dev/null >> "$DIR/logs/cloudflared.log" 2>&1 &
+        else
+          "$cf_bin" tunnel --url http://127.0.0.1:8080 >> "$DIR/logs/cloudflared.log" 2>&1 &
+        fi
         TUNNEL_PID=$!
       fi
 
@@ -555,10 +605,14 @@ else
   echo "==========================================================="
 fi
 
-# If boot command from systemd, disown background jobs and exit 0 so forking service succeeds
-if [ "$1" = "boot" ]; then
+# If running in daemon mode (prod, start, restart, boot, or backgrounded), disown and exit 0 cleanly
+if [ "$DAEMON_MODE" = "true" ]; then
   disown -a 2>/dev/null || true
-  echo "StreamVault background startup sequence complete."
+  echo ""
+  echo -e "${GREEN}[ ✓ ] StreamVault background startup sequence complete.${NC}"
+  echo -e "Services are running detached in background."
+  echo -e "Run ${BOLD}./start.sh status${NC} to view health, or ${BOLD}./start.sh stop${NC} to shutdown."
+  echo ""
   exit 0
 fi
 
