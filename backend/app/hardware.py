@@ -388,7 +388,9 @@ def get_static_hardware_info() -> Dict[str, Any]:
     cpu_cores = psutil.cpu_count(logical=True) or 1
     vm = psutil.virtual_memory()
     total_ram_gb = round(vm.total / (1024 ** 3), 2)
-    disk_info = psutil.disk_usage("/")
+    media_dir = os.environ.get("MEDIA_DIR") or "/home/ubuntu/streamvault/media"
+    disk_target = media_dir if os.path.exists(media_dir) else "/"
+    disk_info = psutil.disk_usage(disk_target)
     total_disk_gb = round(disk_info.total / (1024 ** 3), 2)
 
     encoders = detect_ffmpeg_encoders()
@@ -446,7 +448,9 @@ def get_system_capabilities() -> Dict[str, Any]:
     available_ram_gb = round(vm.available / (1024 ** 3), 2)
     ram_percent = vm.percent
 
-    disk_info = psutil.disk_usage("/")
+    media_dir = os.environ.get("MEDIA_DIR") or "/home/ubuntu/streamvault/media"
+    disk_target = media_dir if os.path.exists(media_dir) else "/"
+    disk_info = psutil.disk_usage(disk_target)
     free_disk_gb = round(disk_info.free / (1024 ** 3), 2)
     disk_percent = disk_info.percent
 
