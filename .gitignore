@@ -18,7 +18,13 @@ cloudflared
 *.dll
 *.so
 *.dylib
+*.apk
+*.aab
+*.aar
+streamvault-jioos-tv.apk
 .bin/
+.gradle/
+**/build/outputs/
 
 # 3. Python Virtualenvs & Caches
 venv

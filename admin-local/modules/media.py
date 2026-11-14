@@ -1687,9 +1687,9 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
           console.warn('Unexpected non-array data from incoming-files:', data);
         }
 
-        cachedIncomingFiles = list;
+        cachedIncomingFiles = Array.isArray(list) ? list : [];
 
-        const existingFilenames = new Set((cachedIncomingFiles || []).map(f => f.filename));
+        const existingFilenames = new Set(cachedIncomingFiles.map(f => f && f.filename).filter(Boolean));
         for (const fn of selectedIncoming) {
           if (!existingFilenames.has(fn)) selectedIncoming.delete(fn);
         }
@@ -1697,7 +1697,10 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
         renderIncomingFiles();
       } catch (e) {
         console.warn('fetchIncomingFiles error:', e);
-        if (!Array.isArray(cachedIncomingFiles) || cachedIncomingFiles.length === 0) {
+        if (!Array.isArray(cachedIncomingFiles)) {
+          cachedIncomingFiles = [];
+        }
+        if (cachedIncomingFiles.length === 0) {
           const cont = document.getElementById('incoming-files-list');
           if (cont) cont.innerHTML = '<div class="text-red-400 py-1">Could not fetch incoming folder: ' + escapeHtml(e.message) + '</div>';
         } else {

@@ -726,6 +726,26 @@ except Exception:
       -d "{\"site_url\":\"${TARGET_ORIGIN}\",\"uri_allow_list\":\"${ALLOW_LIST}\"}" >/dev/null 2>&1 || true
   fi
 
+  # Publish active server & tunnel endpoints to Supabase for dynamic Android TV / JioOS discovery
+  if [ -n "${SUPABASE_URL:-}" ] && [ -n "${SUPABASE_SERVICE_ROLE_KEY:-}" ]; then
+    PAGES_ORIGIN=""
+    if [[ "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
+      PAGES_ORIGIN="https://${PUBLIC_DOMAIN}"
+    elif [ -n "${CF_PAGES_PROJECT:-}" ]; then
+      PAGES_ORIGIN="https://${CF_PAGES_PROJECT}.pages.dev"
+    fi
+    ACT_TUNNEL="$([ -n "$TUNNEL_URL" ] && echo "\"${TUNNEL_URL}\"" || echo "null")"
+    ACT_PAGES="$([ -n "$PAGES_ORIGIN" ] && echo "\"${PAGES_ORIGIN}\"" || echo "null")"
+    ACT_SERVER="\"${TARGET_ORIGIN}\""
+    NOW_ISO="$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null || date +"%Y-%m-%dT%H:%M:%SZ")"
+    curl -s -X PATCH "${SUPABASE_URL}/rest/v1/system_settings?id=eq.1" \
+      -H "apikey: ${SUPABASE_SERVICE_ROLE_KEY}" \
+      -H "Authorization: Bearer ${SUPABASE_SERVICE_ROLE_KEY}" \
+      -H "Content-Type: application/json" \
+      -H "Prefer: return=minimal" \
+      -d "{\"active_server_url\":${ACT_SERVER},\"active_tunnel_url\":${ACT_TUNNEL},\"cloudflare_pages_url\":${ACT_PAGES},\"server_heartbeat_at\":\"${NOW_ISO}\"}" >/dev/null 2>&1 || true
+  fi
+
   echo ""
   echo "==========================================================="
   echo "  StreamVault PRODUCTION GATEWAY is LIVE!                 "

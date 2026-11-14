@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { Edit2, LogOut, Check, Trash2, Clock, ThumbsUp, Bookmark, Play, X, ChevronLeft, ChevronRight } from 'lucide-react';
+import { Edit2, LogOut, Check, Trash2, Clock, ThumbsUp, Bookmark, Play, X, ChevronLeft, ChevronRight, Server } from 'lucide-react';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useUIStore } from '../../store/useUIStore';
 import { usePlayerStore } from '../../store/usePlayerStore';
@@ -8,6 +8,7 @@ import { PRESET_AVATARS } from '../../lib/avatars';
 import { CustomList, Episode, MediaItem, WatchProgressItem } from '../../types';
 import { PosterCard } from '../home/PosterCard';
 import { MediaImage } from '../common/MediaImage';
+import { ServerConfigModal } from '../common/ServerConfigModal';
 
 interface WatchHistoryRow {
   id: string;
@@ -101,6 +102,7 @@ export const ProfileScreen: React.FC = () => {
   const { openPlayer } = usePlayerStore();
 
   const [showAvatarModal, setShowAvatarModal] = useState(false);
+  const [showServerModal, setShowServerModal] = useState(false);
   const [continueWatching, setContinueWatching] = useState<WatchProgressItem[]>([]);
   const [likedMedia, setLikedMedia] = useState<MediaItem[]>([]);
   const [customLists, setCustomLists] = useState<CustomList[]>([]);
@@ -260,14 +262,24 @@ export const ProfileScreen: React.FC = () => {
           </p>
         </div>
 
-        {/* Sign Out Button */}
-        <button
-          onClick={signOut}
-          className="px-5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-2"
-        >
-          <LogOut className="w-4 h-4" />
-          Sign Out
-        </button>
+        {/* Action Buttons */}
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowServerModal(true)}
+            className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-2"
+            title="Configure StreamVault Server / Host Endpoint"
+          >
+            <Server className="w-4 h-4 text-emerald-400" />
+            Server Settings
+          </button>
+          <button
+            onClick={signOut}
+            className="px-5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-2"
+          >
+            <LogOut className="w-4 h-4" />
+            Sign Out
+          </button>
+        </div>
       </div>
 
       {/* 12 Built-In Preset Avatars Modal */}
@@ -525,6 +537,11 @@ export const ProfileScreen: React.FC = () => {
           </div>
         )}
       </div>
+
+      <ServerConfigModal
+        isOpen={showServerModal}
+        onClose={() => setShowServerModal(false)}
+      />
     </div>
   );
 };

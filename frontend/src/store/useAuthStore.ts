@@ -576,7 +576,7 @@ export const useAuthStore = create<AuthState>((set, get) => ({
     const { session } = get();
     if (session?.access_token) {
       try {
-        await sendTelemetryLogout(session.access_token, getCachedSessionLogId());
+        await sendTelemetryLogout(session.access_token, getCachedSessionLogId(), true);
       } catch (err) {
         console.warn('Sign-out telemetry warning:', err);
       }

@@ -101,12 +101,27 @@ export const DetailModal: React.FC = () => {
           ) {
             setTrailerError(true);
             setTrailerReady(false);
+            return;
           }
-          if (
-            (data.event === 'onStateChange' && (data.info === 1 || data.info === 3)) ||
-            (data.info && (data.info.playerState === 1 || data.info.playerState === 3)) ||
-            data.event === 'onReady'
-          ) {
+
+          // When onReady arrives, trigger playback and mute handshake, but do NOT reveal iframe yet
+          if (data.event === 'onReady') {
+            const win = trailerIframeRef.current?.contentWindow;
+            if (win) {
+              try {
+                win.postMessage(JSON.stringify({ event: 'command', func: 'mute', args: [] }), '*');
+                win.postMessage(JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*');
+              } catch {}
+            }
+            return;
+          }
+
+          // STRICT REVEAL: ONLY set trailerReady = true when YouTube explicitly confirms PLAYING (state === 1)
+          const isPlayingState =
+            (data.event === 'onStateChange' && data.info === 1) ||
+            (data.info && data.info.playerState === 1);
+
+          if (isPlayingState) {
             setTrailerReady(true);
             setTrailerError(false);
           }
@@ -140,21 +155,17 @@ export const DetailModal: React.FC = () => {
           win.postMessage(JSON.stringify({ event: 'command', func: 'playVideo', args: [] }), '*');
         } catch {}
       }, 500);
-
-      setTimeout(() => {
-        setTrailerReady(prev => (!prev ? true : prev));
-      }, 2500);
     } catch {}
   };
 
-  // Fallback watchdog: If YouTube trailer genuinely fails to load within 12s, fallback cleanly to backdrop poster
+  // Fallback watchdog: If YouTube trailer genuinely fails to reach PLAYING within 4.5s (e.g. bot check wall, ad-blocker), fallback cleanly to backdrop poster
   useEffect(() => {
     if (!trailer || trailer.type !== 'youtube' || trailerReady || trailerError) return;
 
     const timer = setTimeout(() => {
       setTrailerError(true);
       setTrailerReady(false);
-    }, 12000);
+    }, 4500);
 
     return () => clearTimeout(timer);
   }, [trailer, trailerReady, trailerError]);
@@ -819,6 +830,7 @@ export const DetailModal: React.FC = () => {
                     }}
                     src={`https://www.youtube-nocookie.com/embed/${trailer.src}?autoplay=1&mute=1&controls=0&loop=1&playlist=${trailer.src}&modestbranding=1&rel=0&iv_load_policy=3&disablekb=1&enablejsapi=1&origin=${typeof window !== 'undefined' ? window.location.origin : ''}&playsinline=1`}
                     title="Trailer Preview"
+                    referrerPolicy="origin"
                     allow="autoplay; encrypted-media; picture-in-picture"
                     onError={() => {
                       setTrailerError(true);

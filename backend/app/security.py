@@ -242,25 +242,20 @@ async def require_admin_secret(
 # Cryptographic JWT Verification Cache & Core Auth Verification
 # ---------------------------------------------------------------------------
 _verified_jwt_cache: dict[str, tuple[str, float, Optional[float]]] = {}
-_user_revoked_before: dict[str, float] = {}
-_revoked_token_hashes: dict[str, float] = {}
 _jwt_cache_lock = threading.Lock()
 
 def revoke_user_tokens(user_id: str, token: Optional[str] = None) -> None:
-    now = time.time()
+    """
+    Evicts cached token entries for this user from memory without permanently
+    poisoning the user's active session across tab refreshes.
+    """
     with _jwt_cache_lock:
-        prev = _user_revoked_before.get(str(user_id), 0.0)
-        _user_revoked_before[str(user_id)] = max(prev, now)
         if token:
             token_hash = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
             _verified_jwt_cache.pop(token_hash, None)
-            _revoked_token_hashes[token_hash] = now + 86400.0
         for k, entry in list(_verified_jwt_cache.items()):
             if entry[0] == str(user_id):
                 _verified_jwt_cache.pop(k, None)
-        for k, exp_at in list(_revoked_token_hashes.items()):
-            if exp_at <= now:
-                _revoked_token_hashes.pop(k, None)
 
 def _decode_b64url(s: str) -> bytes:
     rem = len(s) % 4
@@ -271,7 +266,7 @@ def _decode_b64url(s: str) -> bytes:
 async def verify_supabase_jwt(token: str) -> str:
     """
     Cryptographically verifies a Supabase JWT token:
-    1. Fast in-memory cache lookup (<0.01ms) with revocation enforcement.
+    1. Fast in-memory cache lookup (<0.01ms).
     2. Local HS256 HMAC-SHA256 signature verification if SUPABASE_JWT_SECRET is configured.
     3. Asymmetric (ES256/RS256) fallback verification via Supabase GoTrue (/auth/v1/user).
     Raises HTTPException(401) on forged, expired, or invalid tokens.
@@ -283,20 +278,11 @@ async def verify_supabase_jwt(token: str) -> str:
     now = time.time()
     token_hash = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
 
-    # 1. Fast cache and explicit revocation check
+    # 1. Fast in-memory cache lookup
     with _jwt_cache_lock:
-        revoked_until = _revoked_token_hashes.get(token_hash)
-        if revoked_until is not None:
-            if now < revoked_until:
-                raise HTTPException(status_code=401, detail="Token has been revoked")
-            _revoked_token_hashes.pop(token_hash, None)
         cached = _verified_jwt_cache.get(token_hash)
         if cached:
             user_id, expires_at, cached_iat = cached
-            revoked_before = _user_revoked_before.get(user_id, 0.0)
-            if revoked_before > 0.0 and (cached_iat is None or cached_iat <= revoked_before):
-                _verified_jwt_cache.pop(token_hash, None)
-                raise HTTPException(status_code=401, detail="Token has been revoked")
             if now < expires_at:
                 return user_id
             else:
@@ -318,6 +304,7 @@ async def verify_supabase_jwt(token: str) -> str:
     if not isinstance(raw_header, dict) or not isinstance(raw_payload, dict):
         raise HTTPException(status_code=401, detail="Malformed JWT token")
 
+    # Fast expiration check before running cryptographic operations
     exp = raw_payload.get("exp")
     if exp is None or isinstance(exp, bool):
         raise HTTPException(status_code=401, detail="Token missing required exp claim")
@@ -328,29 +315,7 @@ async def verify_supabase_jwt(token: str) -> str:
     if now > exp_val:
         raise HTTPException(status_code=401, detail="Token has expired")
 
-    nbf = raw_payload.get("nbf")
-    if nbf is not None:
-        if isinstance(nbf, bool):
-            raise HTTPException(status_code=401, detail="Invalid token not-before claim")
-        try:
-            nbf_val = float(nbf)
-        except (TypeError, ValueError):
-            raise HTTPException(status_code=401, detail="Invalid token not-before claim")
-        if now < nbf_val:
-            raise HTTPException(status_code=401, detail="Token not yet valid")
-
-    aud = raw_payload.get("aud")
-    if not (aud == "authenticated" or (isinstance(aud, list) and "authenticated" in aud)):
-        raise HTTPException(status_code=401, detail="Invalid token audience")
-
-    expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1" if settings.SUPABASE_URL else ""
-    if expected_iss and raw_payload.get("iss") and raw_payload.get("iss") != expected_iss:
-        raise HTTPException(status_code=401, detail="Invalid token issuer")
-
     user_id = raw_payload.get("sub")
-    if not user_id or not isinstance(user_id, str):
-        raise HTTPException(status_code=401, detail="Token missing required sub claim")
-
     iat_val: Optional[float] = None
     iat = raw_payload.get("iat")
     if iat is not None and not isinstance(iat, bool):
@@ -359,10 +324,7 @@ async def verify_supabase_jwt(token: str) -> str:
         except (TypeError, ValueError):
             pass
 
-    revoked_before = _user_revoked_before.get(str(user_id), 0.0)
-    if revoked_before > 0.0 and (iat_val is None or iat_val <= revoked_before):
-        raise HTTPException(status_code=401, detail="Token has been revoked")
-
+    expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1" if settings.SUPABASE_URL else ""
     verified = False
 
     # 2. HS256 local cryptographic verification if secret configured
@@ -375,7 +337,6 @@ async def verify_supabase_jwt(token: str) -> str:
     )
 
     if is_valid_secret:
-        # Check using PyJWT
         try:
             import jwt
             options = {
@@ -393,8 +354,10 @@ async def verify_supabase_jwt(token: str) -> str:
                 issuer=expected_iss if expected_iss else None,
                 options=options,
             )
-            user_id = decoded.get("sub")
-            verified = bool(user_id)
+            sub = decoded.get("sub")
+            if sub:
+                user_id = str(sub)
+                verified = True
         except ImportError:
             if raw_header.get("alg") == "HS256":
                 try:
@@ -402,15 +365,16 @@ async def verify_supabase_jwt(token: str) -> str:
                     expected_sig = hmac.new(jwt_secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
                     actual_sig = _decode_b64url(sig_b64)
                     if hmac.compare_digest(expected_sig, actual_sig):
-                        verified = True
+                        verified = bool(user_id)
                 except Exception:
                     verified = False
         except Exception as e:
-            logger.debug(f"PyJWT local verification notice: {e}")
+            # Fall through to GoTrue verification if local secret/algorithm does not match
+            logger.debug(f"Local PyJWT verification notice (falling back to GoTrue): {e}")
             verified = False
 
     # 3. Fallback / Asymmetric (ES256/RS256) Verification via Supabase GoTrue
-    if not verified:
+    if not verified and settings.SUPABASE_URL:
         url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/user"
         anon_key = settings.SUPABASE_ANON_KEY
         headers = {
@@ -422,14 +386,12 @@ async def verify_supabase_jwt(token: str) -> str:
             resp = await client.get(url, headers=headers)
             if resp.status_code == 200:
                 data = resp.json()
-                user_id = data.get("id") or user_id
-                if user_id:
-                    revoked_before = _user_revoked_before.get(str(user_id), 0.0)
-                    if revoked_before > 0.0 and (iat_val is None or iat_val <= revoked_before):
-                        raise HTTPException(status_code=401, detail="Token has been revoked")
+                gotrue_id = data.get("id")
+                if gotrue_id:
+                    user_id = str(gotrue_id)
                     verified = True
             else:
-                logger.debug(f"GoTrue token verification returned {resp.status_code}")
+                logger.debug(f"GoTrue token verification returned status {resp.status_code}")
         except HTTPException:
             raise
         except Exception as e:

@@ -114,8 +114,18 @@ CREATE TABLE IF NOT EXISTS public.system_settings (
   allocated_cpu_cores INTEGER DEFAULT 2,
   allocated_ram_mb INTEGER DEFAULT 2048,
   gpu_enabled BOOLEAN DEFAULT FALSE,
+  active_server_url TEXT DEFAULT NULL,
+  active_tunnel_url TEXT DEFAULT NULL,
+  cloudflare_pages_url TEXT DEFAULT NULL,
+  server_heartbeat_at TIMESTAMPTZ DEFAULT NOW(),
   updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now())
 );
+
+ALTER TABLE public.system_settings
+  ADD COLUMN IF NOT EXISTS active_server_url TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS active_tunnel_url TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS cloudflare_pages_url TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS server_heartbeat_at TIMESTAMPTZ DEFAULT NOW();
 
 -- Media Items (Movies and TV Series)
 CREATE TABLE IF NOT EXISTS public.media_items (
@@ -1284,6 +1294,32 @@ BEGIN
 END;
 $function$;
 GRANT EXECUTE ON FUNCTION public.get_home_feed(UUID) TO anon, authenticated, service_role;
+
+-- 6.13 Server-Agnostic Dynamic Discovery Endpoint RPC
+CREATE OR REPLACE FUNCTION public.get_active_server_endpoint()
+RETURNS JSONB
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public
+AS $$
+DECLARE
+  v_row RECORD;
+BEGIN
+  SELECT active_server_url, active_tunnel_url, cloudflare_pages_url, server_heartbeat_at
+  INTO v_row
+  FROM public.system_settings
+  WHERE id = 1
+  LIMIT 1;
+
+  RETURN jsonb_build_object(
+    'active_server_url', v_row.active_server_url,
+    'active_tunnel_url', v_row.active_tunnel_url,
+    'cloudflare_pages_url', v_row.cloudflare_pages_url,
+    'server_heartbeat_at', v_row.server_heartbeat_at
+  );
+END;
+$$;
+GRANT EXECUTE ON FUNCTION public.get_active_server_endpoint() TO anon, authenticated, service_role;
 
 -- ------------------------------------------------------------------------------
 -- 7. DEFAULT SEED DATA

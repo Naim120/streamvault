@@ -224,6 +224,7 @@ class HeartbeatPayload(BaseModel):
 
 class LogoutPayload(BaseModel):
     session_log_id: Optional[str] = None
+    explicit_signout: Optional[bool] = False
 
 
 @router.post("/session-start")
@@ -464,10 +465,11 @@ async def record_logout(
     Authenticated session signout / tab close hook.
     Flushes any buffered heartbeat deltas, marks user as offline, and records logout timestamp.
     """
-    # Invalidate cached JWT token and record revocation timestamp for user
-    auth_header = request.headers.get("authorization", "")
-    token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else None
-    revoke_user_tokens(user_id, token)
+    # Invalidate cached JWT token ONLY when user explicitly signs out
+    if payload.explicit_signout:
+        auth_header = request.headers.get("authorization", "")
+        token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else None
+        revoke_user_tokens(user_id, token)
 
     # 1. Flush any pending buffered heartbeat deltas before logging out
     entry = None

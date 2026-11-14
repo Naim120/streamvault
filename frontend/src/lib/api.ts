@@ -1,16 +1,39 @@
 import { SystemCapabilities, SystemSettings } from '../types';
 import { supabase } from './supabase';
+import { resolveApiUrl, handleServerConnectionError, isNativeApp } from './serverDiscovery';
 
-// Pure single-origin root-relative routing: All /api and /media requests flow to the
-// current origin. Vite dev server proxies to :8000 locally, and Nginx proxies in production.
-const API_BASE = '';
-const getOrigin = () => (typeof window !== 'undefined' ? window.location.origin : 'http://localhost');
+const getOrigin = () => {
+  if (isNativeApp()) {
+    const base = resolveApiUrl('/');
+    if (base.startsWith('http')) {
+      try {
+        return new URL(base).origin;
+      } catch {}
+    }
+  }
+  return typeof window !== 'undefined' ? window.location.origin : 'http://localhost';
+};
+
 const getAdminSecret = (providedSecret?: string) => providedSecret || '';
+
+const safeFetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+  try {
+    const res = await fetch(input, init);
+    if (!res.ok && (res.status === 502 || res.status === 503 || res.status === 504)) {
+      handleServerConnectionError(res.status);
+    }
+    return res;
+  } catch (err) {
+    handleServerConnectionError(err);
+    throw err;
+  }
+};
 
 export const api = {
   // 1. Streaming Token & URLs
   async getStreamToken(mediaId: string, userId?: string) {
-    const url = new URL('/api/stream/token', getOrigin());
+    const targetUrl = resolveApiUrl('/api/stream/token');
+    const url = new URL(targetUrl, getOrigin());
     url.searchParams.set('media_id', mediaId);
     if (userId) url.searchParams.set('user_id', userId);
 
@@ -22,7 +45,7 @@ export const api = {
       }
     } catch {}
 
-    const res = await fetch(url.toString(), { headers });
+    const res = await safeFetch(url.toString(), { headers });
     if (!res.ok) throw new Error('Failed to generate streaming token');
     return res.json() as Promise<{
       media_id: string;
@@ -63,7 +86,7 @@ export const api = {
   },
 
   async getStreamTracks(targetId: string) {
-    const res = await fetch(`${API_BASE}/api/metadata/streams/${targetId}/tracks`);
+    const res = await safeFetch(resolveApiUrl(`/api/metadata/streams/${targetId}/tracks`));
     if (!res.ok) throw new Error('Failed to fetch stream tracks');
     return res.json() as Promise<{
       target_id: string;
@@ -89,18 +112,18 @@ export const api = {
   },
 
   getManifestUrl(targetId: string, token: string, expires: number, uid: string) {
-    return `/api/stream/${targetId}/master.m3u8?token=${token}&expires=${expires}&uid=${uid}`;
+    return resolveApiUrl(`/api/stream/${targetId}/master.m3u8?token=${token}&expires=${expires}&uid=${uid}`);
   },
 
   getSubtitleUrl(targetId: string, subPath: string, token: string, expires: number, uid: string) {
     const cleanPath = subPath.startsWith('/') ? subPath.slice(1) : subPath;
-    return `/api/stream/${targetId}/${cleanPath}?token=${token}&expires=${expires}&uid=${uid}`;
+    return resolveApiUrl(`/api/stream/${targetId}/${cleanPath}?token=${token}&expires=${expires}&uid=${uid}`);
   },
 
   // 2. Login Telemetry
   async recordLoginTelemetry(payload: { user_id: string; email?: string; device_type?: string }) {
     try {
-      await fetch(`${API_BASE}/api/telemetry/login`, {
+      await safeFetch(resolveApiUrl('/api/telemetry/login'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
@@ -112,17 +135,17 @@ export const api = {
 
   // 3. System Hardware & Transcode Settings
   async getCapabilities(): Promise<SystemCapabilities> {
-    const res = await fetch(`${API_BASE}/api/system/capabilities`);
+    const res = await safeFetch(resolveApiUrl('/api/system/capabilities'));
     return res.json();
   },
 
   async getSettings(): Promise<SystemSettings> {
-    const res = await fetch(`${API_BASE}/api/system/settings`);
+    const res = await safeFetch(resolveApiUrl('/api/system/settings'));
     return res.json();
   },
 
   async updateSettings(payload: Partial<SystemSettings>, adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/system/settings`, {
+    const res = await safeFetch(resolveApiUrl('/api/system/settings'), {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -135,27 +158,28 @@ export const api = {
   },
 
   async getQueueStatus() {
-    const res = await fetch(`${API_BASE}/api/system/status`);
+    const res = await safeFetch(resolveApiUrl('/api/system/status'));
     return res.json();
   },
 
   // 4. TMDB & Catalog Ingestion
   async searchTMDB(query: string, type: 'movie' | 'tv' | 'multi' = 'multi') {
-    const url = new URL('/api/metadata/search', getOrigin());
+    const targetUrl = resolveApiUrl('/api/metadata/search');
+    const url = new URL(targetUrl, getOrigin());
     url.searchParams.set('query', query);
     url.searchParams.set('type', type);
-    const res = await fetch(url.toString());
+    const res = await safeFetch(url.toString());
     return res.json();
   },
 
   async getTMDBDetails(tmdbId: number, type: 'movie' | 'series' = 'movie') {
-    const res = await fetch(`${API_BASE}/api/metadata/details/${tmdbId}?type=${type}`);
+    const res = await safeFetch(resolveApiUrl(`/api/metadata/details/${tmdbId}?type=${type}`));
     if (!res.ok) throw new Error('Details not found');
     return res.json();
   },
 
   async listIncomingFiles(adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/metadata/incoming-files`, {
+    const res = await safeFetch(resolveApiUrl('/api/metadata/incoming-files'), {
       headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) }
     });
     return res.json();
@@ -168,7 +192,7 @@ export const api = {
     season_number?: number;
     episode_number?: number;
   }, adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/metadata/ingest`, {
+    const res = await safeFetch(resolveApiUrl('/api/metadata/ingest'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -181,7 +205,7 @@ export const api = {
   },
 
   async updateBadge(mediaId: string, badgeType: string, adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/metadata/badge/${mediaId}`, {
+    const res = await safeFetch(resolveApiUrl(`/api/metadata/badge/${mediaId}`), {
       method: 'PATCH',
       headers: {
         'Content-Type': 'application/json',
@@ -193,7 +217,7 @@ export const api = {
   },
 
   async deleteMedia(mediaId: string, adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/metadata/media/${mediaId}`, {
+    const res = await safeFetch(resolveApiUrl(`/api/metadata/media/${mediaId}`), {
       method: 'DELETE',
       headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) }
     });
@@ -202,14 +226,14 @@ export const api = {
 
   // 5. Aria2 Downloader Controls
   async getAria2Stats(adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/aria2/stats`, {
+    const res = await safeFetch(resolveApiUrl('/api/aria2/stats'), {
       headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) }
     });
     return res.json();
   },
 
   async listAria2Downloads(adminSecret?: string) {
-    const res = await fetch(`${API_BASE}/api/aria2/downloads`, {
+    const res = await safeFetch(resolveApiUrl('/api/aria2/downloads'), {
       headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) }
     });
     return res.json();
@@ -217,7 +241,7 @@ export const api = {
 
   async addAria2Download(data: FormData | string, meta?: { title?: string; type?: string }, adminSecret?: string) {
     if (typeof data === 'string') {
-      const res = await fetch(`${API_BASE}/api/aria2/add`, {
+      const res = await safeFetch(resolveApiUrl('/api/aria2/add'), {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -228,7 +252,7 @@ export const api = {
       if (!res.ok) throw new Error('Failed to submit download to Aria2');
       return res.json();
     } else {
-      const res = await fetch(`${API_BASE}/api/aria2/add`, {
+      const res = await safeFetch(resolveApiUrl('/api/aria2/add'), {
         method: 'POST',
         headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) },
         body: data
@@ -240,7 +264,7 @@ export const api = {
 
   async aria2Action(action: 'pause' | 'unpause' | 'remove', gid: string, adminSecret?: string) {
     const method = action === 'remove' ? 'DELETE' : 'POST';
-    const res = await fetch(`${API_BASE}/api/aria2/${action}/${gid}`, {
+    const res = await safeFetch(resolveApiUrl(`/api/aria2/${action}/${gid}`), {
       method,
       headers: { 'X-Admin-Secret': getAdminSecret(adminSecret) }
     });
@@ -249,8 +273,8 @@ export const api = {
 
   // 6. Security-Guarded Auth Endpoints
   async forgotPassword(email: string, honeypot: string = '') {
-    const origin = typeof window !== 'undefined' ? window.location.origin : undefined;
-    const res = await fetch(`${API_BASE}/api/auth/forgot-password`, {
+    const origin = getOrigin();
+    const res = await safeFetch(resolveApiUrl('/api/auth/forgot-password'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email.trim().toLowerCase(), _honeypot: honeypot, origin, client_origin: origin })
@@ -286,7 +310,7 @@ export const api = {
     }
     if (!token) return null;
 
-    const res = await fetch(`${API_BASE}/api/auth/password-reset-complete`, {
+    const res = await safeFetch(resolveApiUrl('/api/auth/password-reset-complete'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -299,7 +323,7 @@ export const api = {
   },
 
   async getResetFlowStatus(email: string, resetFlowToken: string) {
-    const res = await fetch(`${API_BASE}/api/auth/reset-flow-status`, {
+    const res = await safeFetch(resolveApiUrl('/api/auth/reset-flow-status'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -322,7 +346,7 @@ export const api = {
   },
 
   async signupPrecheck(email: string) {
-    const res = await fetch(`${API_BASE}/api/auth/signup-precheck`, {
+    const res = await safeFetch(resolveApiUrl('/api/auth/signup-precheck'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email.trim().toLowerCase() })
@@ -345,9 +369,9 @@ export const api = {
   },
 
   async resendVerification(email: string, honeypot: string = '', redirectTo?: string) {
-    const origin = typeof window !== 'undefined' ? window.location.origin : undefined;
+    const origin = getOrigin();
     const safeRedirect = redirectTo || (origin && !origin.includes('localhost') && !origin.includes('127.0.0.1') ? `${origin}/home` : undefined);
-    const res = await fetch(`${API_BASE}/api/auth/resend-verification`, {
+    const res = await safeFetch(resolveApiUrl('/api/auth/resend-verification'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -375,7 +399,7 @@ export const api = {
   },
 
   async getVerificationStatus(email: string) {
-    const res = await fetch(`${API_BASE}/api/auth/verification-status`, {
+    const res = await safeFetch(resolveApiUrl('/api/auth/verification-status'), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ email: email.trim().toLowerCase() })
@@ -395,7 +419,7 @@ export const api = {
   },
 
   async getRedirectOrigin(): Promise<{ origin: string }> {
-    const res = await fetch(`${API_BASE}/api/auth/redirect-origin`);
+    const res = await safeFetch(resolveApiUrl('/api/auth/redirect-origin'));
     if (!res.ok) throw new Error('Failed to fetch redirect origin');
     return res.json() as Promise<{ origin: string }>;
   }

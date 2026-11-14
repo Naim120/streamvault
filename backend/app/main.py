@@ -407,10 +407,14 @@ class DynamicCORSMiddleware(CORSMiddleware):
     Statically allows approved origins and LAN subnets.
     Only allows a trycloudflare.com origin if it matches THIS host's active tunnel,
     rejecting any third-party attacker-controlled *.trycloudflare.com tunnels.
-    Also validates any configured public domain (e.g. *.pages.dev).
+    Also validates any configured public domain (e.g. *.pages.dev) and native APK schemes.
     """
     def is_allowed_origin(self, origin: str) -> bool:
         if super().is_allowed_origin(origin):
+            return True
+        if origin in ("capacitor://localhost", "http://localhost", "https://localhost"):
+            return True
+        if origin and re.match(r"^https://[a-zA-Z0-9_.-]+\.pages\.dev(:\d+)?$", origin):
             return True
         if origin and "trycloudflare.com" in origin:
             active_tunnel = get_active_cloudflared_origin()
@@ -424,11 +428,18 @@ class DynamicCORSMiddleware(CORSMiddleware):
 app.add_middleware(
     DynamicCORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|100\.\d+\.\d+\.\d+)(:\d+)?$",
+    allow_origin_regex=r"^(https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|100\.\d+\.\d+\.\d+)(:\d+)?|capacitor://localhost|https://[a-zA-Z0-9_.-]+\.pages\.dev(:\d+)?)$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
     allow_headers=["*"],
 )
+
+@app.get("/api/ping")
+async def ping():
+    """
+    Public connectivity and discovery verification beacon for Android TV / JioOS and native clients.
+    """
+    return {"status": "ok", "service": "streamvault", "version": "2.6.0"}
 
 # Include API Routers
 app.include_router(stream.router)

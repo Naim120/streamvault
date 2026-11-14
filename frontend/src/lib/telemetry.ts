@@ -2,6 +2,9 @@
  * StreamVault Production Client Telemetry & Dual-Stack IP Probe
  */
 
+import { resolveApiUrl } from './serverDiscovery';
+import { supabase } from './supabase';
+
 export interface DualStackIPs {
   ipv4: string | null;
   ipv6: string | null;
@@ -91,23 +94,40 @@ export function clearTelemetrySession() {
   } catch {}
 }
 
+export async function getEffectiveToken(providedToken?: string | null): Promise<string | null> {
+  if (providedToken && typeof providedToken === 'string' && providedToken.trim().length > 10) {
+    return providedToken.trim();
+  }
+  try {
+    const { data } = await supabase.auth.getSession();
+    const token = data?.session?.access_token;
+    if (token && typeof token === 'string' && token.trim().length > 10) {
+      return token.trim();
+    }
+  } catch {}
+  return null;
+}
+
 /**
  * Starts an authenticated telemetry session and stores session_log_id.
  */
 export async function startTelemetrySession(
-  accessToken: string,
+  accessToken?: string | null,
   email?: string
 ): Promise<string | null> {
+  const token = await getEffectiveToken(accessToken);
+  if (!token) return null;
+
   try {
     const ips = await probeDualStackIPs();
     const isMobile = typeof window !== 'undefined' && window.innerWidth < 768;
     const deviceType = isMobile ? 'Mobile' : 'Desktop';
 
-    const res = await fetch('/api/telemetry/session-start', {
+    const res = await fetch(resolveApiUrl('/api/telemetry/session-start'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${token}`
       },
       body: JSON.stringify({
         client_ipv4: ips.ipv4,
@@ -155,10 +175,10 @@ export function handleCatalogVersion(newVer: number | undefined | null) {
 }
 
 /**
- * Sends a 60-second activity and watch-time heartbeat.
+ * Sends a periodic activity and watch-time heartbeat.
  */
 export async function sendTelemetryHeartbeat(
-  accessToken: string,
+  accessToken: string | null | undefined,
   payload: {
     session_log_id?: string | null;
     delta_site_seconds: number;
@@ -168,23 +188,47 @@ export async function sendTelemetryHeartbeat(
     client_ipv6?: string | null;
   }
 ): Promise<void> {
+  let token = await getEffectiveToken(accessToken);
+  if (!token) return;
+
   try {
     const ips = await probeDualStackIPs();
-    const res = await fetch('/api/telemetry/heartbeat', {
+    const bodyStr = JSON.stringify({
+      session_log_id: payload.session_log_id || getCachedSessionLogId(),
+      delta_site_seconds: payload.delta_site_seconds,
+      delta_watch_seconds: payload.delta_watch_seconds,
+      active_media_title: payload.active_media_title,
+      client_ipv4: payload.client_ipv4 || ips.ipv4,
+      client_ipv6: payload.client_ipv6 || ips.ipv6
+    });
+
+    let res = await fetch(resolveApiUrl('/api/telemetry/heartbeat'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${token}`
       },
-      body: JSON.stringify({
-        session_log_id: payload.session_log_id || getCachedSessionLogId(),
-        delta_site_seconds: payload.delta_site_seconds,
-        delta_watch_seconds: payload.delta_watch_seconds,
-        active_media_title: payload.active_media_title,
-        client_ipv4: payload.client_ipv4 || ips.ipv4,
-        client_ipv6: payload.client_ipv6 || ips.ipv6
-      })
+      body: bodyStr
     });
+
+    // If heartbeat returns 401, refresh session and retry once
+    if (res.status === 401) {
+      try {
+        const { data: refreshData } = await supabase.auth.refreshSession();
+        if (refreshData?.session?.access_token) {
+          token = refreshData.session.access_token;
+          res = await fetch(resolveApiUrl('/api/telemetry/heartbeat'), {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`
+            },
+            body: bodyStr
+          });
+        }
+      } catch {}
+    }
+
     if (res.ok) {
       const data = await res.json().catch(() => null);
       if (data && typeof data.catalog_version === 'number') {
@@ -197,27 +241,31 @@ export async function sendTelemetryHeartbeat(
 }
 
 /**
- * Sends a logout signal (supports Beacon API on window unload).
+ * Sends a logout signal.
  */
 export async function sendTelemetryLogout(
-  accessToken: string | null,
-  sessionLogId?: string | null
+  accessToken?: string | null,
+  sessionLogId?: string | null,
+  explicitSignout: boolean = true
 ): Promise<void> {
   const sessionId = sessionLogId || getCachedSessionLogId();
   setCachedSessionLogId(null);
 
-  if (!accessToken) return;
+  const token = await getEffectiveToken(accessToken);
+  if (!token) return;
 
-  const url = '/api/telemetry/logout';
-  const body = JSON.stringify({ session_log_id: sessionId });
+  const url = resolveApiUrl('/api/telemetry/logout');
+  const body = JSON.stringify({
+    session_log_id: sessionId,
+    explicit_signout: explicitSignout
+  });
 
-  // Use fetch with keepalive if available (works on tab close)
   try {
     await fetch(url, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        Authorization: `Bearer ${accessToken}`
+        Authorization: `Bearer ${token}`
       },
       body,
       keepalive: true

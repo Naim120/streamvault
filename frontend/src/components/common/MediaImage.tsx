@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { Film } from 'lucide-react';
 import { sanitizeMediaUrl } from '../../lib/security';
+import { resolveApiUrl } from '../../lib/serverDiscovery';
 
 export interface MediaImageProps {
   title: string;
@@ -30,8 +31,12 @@ export const MediaImage: React.FC<MediaImageProps> = ({
   fetchPriority,
 }) => {
   // Determine primary & secondary URLs based on intended aspect using strict URL sanitizer
-  const cleanPoster = sanitizeMediaUrl(posterUrl);
-  const cleanBackdrop = sanitizeMediaUrl(backdropUrl);
+  const resolveRelative = (url: string | null): string | null => {
+    if (!url) return null;
+    return url.startsWith('/') ? resolveApiUrl(url) : url;
+  };
+  const cleanPoster = resolveRelative(sanitizeMediaUrl(posterUrl));
+  const cleanBackdrop = resolveRelative(sanitizeMediaUrl(backdropUrl));
 
   const isBackdropAspect = aspect === 'backdrop';
   const primaryUrl = isBackdropAspect

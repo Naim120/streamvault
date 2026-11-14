@@ -99,8 +99,18 @@ export const ContinueWatchingRow: React.FC<ContinueWatchingRowProps> = ({ items,
         {items.map((item) => (
           <div
             key={item.media_id}
+            tabIndex={0}
+            role="button"
+            data-tv-card="true"
+            aria-label={`Resume watching ${item.title}`}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault();
+                handlePlay(item);
+              }
+            }}
             onMouseEnter={() => prewarmStream(item.episode_id || item.media_id, user?.id)}
-            className="relative flex-none w-44 sm:w-52 aspect-[2/3] rounded-xl overflow-hidden bg-[#181818] netflix-card-hover group border border-neutral-800/60"
+            className="relative flex-none w-44 sm:w-52 aspect-[2/3] rounded-xl overflow-hidden bg-[#181818] netflix-card-hover group border border-neutral-800/60 cursor-pointer"
           >
             {/* Poster Thumbnail */}
             <MediaImage

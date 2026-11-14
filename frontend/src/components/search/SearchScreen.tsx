@@ -6,6 +6,7 @@ import { useUIStore } from '../../store/useUIStore';
 import { usePlayerStore } from '../../store/usePlayerStore';
 import { MediaItem } from '../../types';
 import { PosterCard } from '../home/PosterCard';
+import { resolveApiUrl } from '../../lib/serverDiscovery';
 import { MediaImage } from '../common/MediaImage';
 import { sanitizeSearchInput, escapeRegex } from '../../lib/security';
 
@@ -172,7 +173,7 @@ export const SearchScreen: React.FC = () => {
       else if (selectedFilter === 'series') url += `&type=series`;
       else if (selectedFilter !== 'all') url += `&genre=${encodeURIComponent(selectedFilter)}`;
 
-      const res = await fetch(url, { signal });
+      const res = await fetch(resolveApiUrl(url), { signal });
       if (!res.ok) throw new Error('Search failed');
       return res.json() as Promise<MediaItem[]>;
     },

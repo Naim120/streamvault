@@ -40,7 +40,17 @@ export const PosterCard: React.FC<PosterCardProps> = ({
 
   return (
     <div
+      tabIndex={0}
+      role="button"
+      data-tv-card="true"
+      aria-label={`View details for ${media.title}`}
       onClick={() => openDetail(media)}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          openDetail(media);
+        }
+      }}
       className={`relative rounded-xl overflow-hidden cursor-pointer group/poster netflix-card-hover bg-[#181818] shadow-md hover:shadow-2xl transition duration-300 min-w-0 ${
         isGrid ? 'w-full aspect-[2/3]' : 'flex-none w-36 sm:w-44 md:w-52 aspect-[2/3]'
       } ${className || ''}`}

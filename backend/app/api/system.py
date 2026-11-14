@@ -135,8 +135,94 @@ async def init_system_settings() -> Dict[str, Any]:
         "cpu_safe": f"CPU-Safe Compatibility Convert (Capped to {res['allocated_cpu_cores']} Threads / ~35% CPU)",
         "gpu_accelerated": "GPU Accelerated Convert" if gpu_active else None
     }
+
+    # Announce live server endpoint to Supabase for dynamic Android TV / JioOS discovery
+    try:
+        beacon_info = await announce_active_server_url()
+        res.update(beacon_info)
+    except Exception as e:
+        logger.warning(f"Initial server discovery beacon announcement notice: {e}")
+
     _cached_settings = res
     return res
+
+
+async def announce_active_server_url(
+    server_url: Optional[str] = None,
+    tunnel_url: Optional[str] = None,
+    pages_url: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Publishes the active server and tunnel URLs to public.system_settings in Supabase
+    so Android TV / JioOS and native apps can dynamically discover and connect to the server.
+    """
+    from ..security import get_active_cloudflared_origin
+    from .auth import get_primary_lan_ip
+
+    nginx_port = os.getenv("NGINX_PORT", "8080")
+    lan_ip = get_primary_lan_ip()
+    lan_fallback = f"http://{lan_ip}:{nginx_port}" if lan_ip and lan_ip != "127.0.0.1" else f"http://localhost:{nginx_port}"
+
+    detected_tunnel = tunnel_url or get_active_cloudflared_origin()
+
+    # Detect Pages URL
+    detected_pages = pages_url
+    if not detected_pages:
+        cf_pages_proj = os.getenv("CF_PAGES_PROJECT") or os.getenv("CLOUDFLARE_PAGES_PROJECT")
+        pub_domain = os.getenv("PUBLIC_DOMAIN", "").strip()
+        if pub_domain and pub_domain.endswith(".pages.dev"):
+            detected_pages = f"https://{pub_domain}"
+        elif cf_pages_proj:
+            detected_pages = f"https://{cf_pages_proj}.pages.dev"
+
+    # Detect active_server_url in priority order:
+    # 1. Cloudflare Quick/Named Tunnel URL or PUBLIC_SITE_URL / PUBLIC_DOMAIN (if not localhost)
+    # 2. Cloudflare Pages URL
+    # 3. Primary LAN IP
+    detected_server = server_url
+    if not detected_server:
+        pub_site = os.getenv("PUBLIC_SITE_URL", "").strip().rstrip("/")
+        pub_domain = os.getenv("PUBLIC_DOMAIN", "").strip().rstrip("/")
+        if detected_tunnel:
+            detected_server = detected_tunnel
+        elif pub_site and "localhost" not in pub_site and "127.0.0.1" not in pub_site:
+            detected_server = pub_site if pub_site.startswith("http") else f"https://{pub_site}"
+        elif pub_domain and "localhost" not in pub_domain and "127.0.0.1" not in pub_domain:
+            detected_server = f"https://{pub_domain}"
+        elif detected_pages:
+            detected_server = detected_pages
+        else:
+            detected_server = lan_fallback
+
+    update_payload = {
+        "active_server_url": detected_server,
+        "active_tunnel_url": detected_tunnel,
+        "cloudflare_pages_url": detected_pages,
+        "server_heartbeat_at": datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        await db.update("system_settings", "id", 1, update_payload)
+        logger.info(f"Announced dynamic server endpoint to Supabase: {update_payload}")
+    except Exception as e:
+        logger.warning(f"Failed to announce dynamic server endpoint to Supabase: {e}")
+
+    return update_payload
+
+
+@router.post("/announce-endpoint", dependencies=[Depends(require_admin_secret)])
+async def api_announce_endpoint(payload: Optional[Dict[str, Any]] = None):
+    """
+    Manually or script-triggered re-announcement of active server endpoint to Supabase.
+    """
+    p = payload or {}
+    res = await announce_active_server_url(
+        server_url=p.get("server_url"),
+        tunnel_url=p.get("tunnel_url"),
+        pages_url=p.get("pages_url")
+    )
+    invalidate_system_caches()
+    return {"status": "ok", "beacon": res}
 
 @router.get("/settings", dependencies=[Depends(require_admin_secret)])
 @router.get("/settings/", dependencies=[Depends(require_admin_secret)])

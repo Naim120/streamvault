@@ -1246,6 +1246,81 @@ export const VideoPlayer: React.FC = () => {
     }
   };
 
+  // JioOS / Android TV Remote Control & D-pad Navigation in Video Player
+  useEffect(() => {
+    const handleRemoteKeyDown = (e: KeyboardEvent) => {
+      // Don't intercept if an input is focused
+      const targetTag = (e.target as HTMLElement)?.tagName?.toUpperCase();
+      if (['INPUT', 'TEXTAREA', 'SELECT'].includes(targetTag)) {
+        return;
+      }
+
+      switch (e.key) {
+        case 'ArrowLeft':
+          e.preventDefault();
+          skipSeconds(-10);
+          setShowControls(true);
+          break;
+        case 'ArrowRight':
+          e.preventDefault();
+          skipSeconds(10);
+          setShowControls(true);
+          break;
+        case 'ArrowUp':
+        case 'ArrowDown':
+          e.preventDefault();
+          setShowControls(true);
+          scheduleControlsHide();
+          break;
+        case ' ':
+        case 'Enter':
+        case 'MediaPlayPause':
+        case 'PlayPause':
+          // If a focused element is a button inside controls, let Enter activate it; otherwise toggle playback
+          if (targetTag !== 'BUTTON') {
+            e.preventDefault();
+            togglePlay();
+          }
+          break;
+        case 'MediaPlay':
+          e.preventDefault();
+          if (videoRef.current?.paused) togglePlay();
+          break;
+        case 'MediaPause':
+          e.preventDefault();
+          if (!videoRef.current?.paused) togglePlay();
+          break;
+        case 'MediaFastForward':
+          e.preventDefault();
+          skipSeconds(10);
+          break;
+        case 'MediaRewind':
+          e.preventDefault();
+          skipSeconds(-10);
+          break;
+        case 'Escape':
+        case 'GoBack':
+        case 'BrowserBack':
+          e.preventDefault();
+          if (showAudioSubModal) {
+            setShowAudioSubModal(false);
+          } else if (showQualityMenu) {
+            setShowQualityMenu(false);
+          } else if (showSpeedMenu) {
+            setShowSpeedMenu(false);
+          } else {
+            handleExitPlayer();
+          }
+          break;
+      }
+    };
+
+    window.addEventListener('keydown', handleRemoteKeyDown, { passive: false });
+    return () => {
+      window.removeEventListener('keydown', handleRemoteKeyDown);
+    };
+  }, [togglePlay, skipSeconds, scheduleControlsHide, showAudioSubModal, showQualityMenu, showSpeedMenu, handleExitPlayer]);
+
   // Staged Audio & Subtitles Apply
   const openAudioSubModal = () => {
     setPendingAudioIndex(activeAudioIndex);
@@ -1557,6 +1632,7 @@ export const VideoPlayer: React.FC = () => {
                 className="w-full h-full border-0"
                 src={`https://www.youtube-nocookie.com/embed/${trailer.src}?autoplay=1&controls=1&modestbranding=1&rel=0&playsinline=1&enablejsapi=1&origin=${typeof window !== 'undefined' ? window.location.origin : ''}`}
                 title={`${media?.title} Official Trailer`}
+                referrerPolicy="origin"
                 allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"
                 allowFullScreen
                 onError={() => setTrailerError(true)}

@@ -4,6 +4,7 @@ import { useAuthStore, cleanAuthUrlParams } from './store/useAuthStore';
 import { useUIStore } from './store/useUIStore';
 import { usePlayerStore } from './store/usePlayerStore';
 import { useIdleSessionManager } from './hooks/useIdleSessionManager';
+import { useTVNavigation } from './hooks/useTVNavigation';
 import { Navbar } from './components/layout/Navbar';
 import { supabase } from './lib/supabase';
 import { MediaItem } from './types';
@@ -73,6 +74,9 @@ function MainApp() {
   useEffect(() => {
     initAuth();
   }, [initAuth]);
+
+  // JioOS / Android TV 10-foot spatial navigation & hardware back routing
+  useTVNavigation();
 
   // Patch history pushState and replaceState to dispatch a navigation event so React stays in sync
   useEffect(() => {

@@ -5,7 +5,6 @@ import { usePlayerStore } from '../store/usePlayerStore';
 import {
   startTelemetrySession,
   sendTelemetryHeartbeat,
-  sendTelemetryLogout,
   getCachedSessionLogId
 } from '../lib/telemetry';
 
@@ -225,10 +224,8 @@ export function useIdleSessionManager() {
     };
 
     const handleBeforeUnload = () => {
-      const token = session?.access_token;
-      if (token) {
-        sendTelemetryLogout(token, getCachedSessionLogId());
-      }
+      // Flush pending watch deltas on tab close/refresh without invalidating active auth session
+      flushTelemetry();
     };
 
     document.addEventListener('visibilitychange', handleVisibilityChange);

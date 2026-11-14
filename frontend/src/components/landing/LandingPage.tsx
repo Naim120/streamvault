@@ -1,14 +1,16 @@
 import React, { useState, useEffect } from 'react';
 import { 
   ChevronRight, Play, Shield, Zap, Globe, Smartphone, Volume2, 
-  ChevronDown, Film, Tv, Star, Check 
+  ChevronDown, Film, Tv, Star, Check, Server 
 } from 'lucide-react';
 import { Footer } from '../layout/Footer';
 import { MediaImage } from '../common/MediaImage';
 import { AuthModal } from '../auth/AuthModal';
+import { ServerConfigModal } from '../common/ServerConfigModal';
 import { updatePageSeo } from '../../lib/seo';
 import { api } from '../../lib/api';
 import { useAuthStore } from '../../store/useAuthStore';
+import { resolveApiUrl } from '../../lib/serverDiscovery';
 
 interface PublicShowcaseItem {
   id: string;
@@ -40,6 +42,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
   const [authTitleNotice, setAuthTitleNotice] = useState<string | null>(initialAuthNotice);
   const [showcaseItems, setShowcaseItems] = useState<PublicShowcaseItem[]>([]);
   const [openFaqIndex, setOpenFaqIndex] = useState<number | null>(null);
+  const [isServerModalOpen, setIsServerModalOpen] = useState(false);
 
   const {
     authModalSuccessNotice,
@@ -92,7 +95,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     let isMounted = true;
     const fetchShowcase = async () => {
       try {
-        const res = await fetch('/api/metadata/public-showcase');
+        const res = await fetch(resolveApiUrl('/api/metadata/public-showcase'));
         if (res.ok) {
           const data = await res.json();
           if (isMounted && Array.isArray(data)) {
@@ -193,6 +196,16 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             <Globe className="w-3.5 h-3.5 text-neutral-400" />
             <span>English</span>
           </div>
+
+          <button
+            onClick={() => setIsServerModalOpen(true)}
+            title="Configure Backend Server Connection"
+            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-neutral-900/80 hover:bg-neutral-800 border border-neutral-800 text-xs text-neutral-300 hover:text-white transition cursor-pointer"
+            tabIndex={0}
+          >
+            <Server className="w-3.5 h-3.5 text-red-500" />
+            <span className="hidden sm:inline">Server</span>
+          </button>
 
           <button
             onClick={() => openAuth('login')}
@@ -507,6 +520,12 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         initialMode={authModalMode}
         titleNotice={authTitleNotice}
         onModeChange={setAuthModalMode}
+      />
+
+      {/* Server Discovery & LAN Config Modal */}
+      <ServerConfigModal
+        isOpen={isServerModalOpen}
+        onClose={() => setIsServerModalOpen(false)}
       />
     </div>
   );

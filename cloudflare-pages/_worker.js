@@ -65,10 +65,40 @@ export default {
       );
     }
 
+    // Preflight CORS handler for API / media requests
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        status: 204,
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, PATCH, OPTIONS",
+          "Access-Control-Allow-Headers": "Authorization, Content-Type, X-Admin-Secret, Range, Origin, Accept",
+          "Access-Control-Max-Age": "86400",
+        },
+      });
+    }
+
     const targetUrl = new URL(url.pathname + url.search, targetOrigin);
 
-    // Forward all headers and append proxy identifiers
-    const proxyHeaders = new Headers(request.headers);
+    // Forward all headers and explicitly preserve auth & content headers
+    const proxyHeaders = new Headers();
+    for (const [key, val] of request.headers.entries()) {
+      proxyHeaders.set(key, val);
+    }
+
+    const authHeader = request.headers.get("Authorization") || request.headers.get("authorization");
+    if (authHeader) {
+      proxyHeaders.set("Authorization", authHeader);
+    }
+    const contentType = request.headers.get("Content-Type") || request.headers.get("content-type");
+    if (contentType) {
+      proxyHeaders.set("Content-Type", contentType);
+    }
+    const cookieHeader = request.headers.get("Cookie") || request.headers.get("cookie");
+    if (cookieHeader) {
+      proxyHeaders.set("Cookie", cookieHeader);
+    }
+
     proxyHeaders.set("X-Forwarded-Host", url.host);
     proxyHeaders.set("X-Forwarded-Proto", "https");
 
