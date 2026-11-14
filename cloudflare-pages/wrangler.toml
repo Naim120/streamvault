@@ -1,0 +1,6 @@
+name = "streamvault-pages"
+compatibility_date = "2024-11-01"
+pages_build_output_dir = "."
+
+[vars]
+BACKEND_TUNNEL_URL = ""

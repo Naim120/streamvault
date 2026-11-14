@@ -165,10 +165,18 @@ show_status() {
   local cf_pid
   cf_pid="$(pgrep -f "cloudflared.*tunnel" | head -n1 || true)"
   if [ -n "$cf_pid" ]; then
-    if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
+    if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ] && [ "$PUBLIC_DOMAIN" != "trycloudflare.com" ] && [[ ! "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
       echo -e "  • Cloudflare Named Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> https://${PUBLIC_DOMAIN})"
+    elif [[ "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
+      echo -e "  • Cloudflare Pages Gateway           : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> https://${PUBLIC_DOMAIN})"
     else
-      echo -e "  • Cloudflare Quick Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid})"
+      local quick_url
+      quick_url="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/logs/cloudflared.log" 2>/dev/null | tail -n1 || true)"
+      if [ -n "$quick_url" ]; then
+        echo -e "  • Cloudflare Quick Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid} -> ${quick_url})"
+      else
+        echo -e "  • Cloudflare Quick Tunnel            : ${GREEN}● RUNNING${NC} (PID: ${cf_pid})"
+      fi
     fi
   else
     echo -e "  • Cloudflare Tunnel                  : ${RED}○ STOPPED${NC}"
@@ -432,24 +440,54 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
 
   # Check for authenticated Named Tunnel from install.sh
   HAS_NAMED_TUNNEL="false"
-  if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
+  if [ -f "$HOME/.cloudflared/config.yml" ] && [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ] && [ "$PUBLIC_DOMAIN" != "trycloudflare.com" ] && [[ ! "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
     HAS_NAMED_TUNNEL="true"
   fi
 
-  if [ "$MODE" = "tunnel" ] || [ "$HAS_NAMED_TUNNEL" = "true" ]; then
+  USE_TUNNEL="false"
+  if [ "$MODE" = "tunnel" ] || [ "$HAS_NAMED_TUNNEL" = "true" ] || [ "${ENABLE_TUNNEL:-false}" = "true" ] || [ "${TUNNEL_TYPE:-none}" = "pages" ] || [ "${TUNNEL_TYPE:-none}" = "quick" ]; then
+    USE_TUNNEL="true"
+  fi
+
+  TUNNEL_URL=""
+  if [ "$USE_TUNNEL" = "true" ]; then
     if [ "$HAS_NAMED_TUNNEL" = "true" ]; then
       echo "Starting Authenticated Cloudflare Named Tunnel (https://${PUBLIC_DOMAIN})..."
       pkill -f "cloudflared.*tunnel.*run" 2>/dev/null || true
       cloudflared --config "$HOME/.cloudflared/config.yml" tunnel run > "$DIR/logs/cloudflared.log" 2>&1 &
       TUNNEL_PID=$!
-    elif [ "$MODE" = "tunnel" ]; then
-      echo "Starting Cloudflare Quick Tunnel to Nginx Gateway (http://127.0.0.1:8080)..."
+    else
+      echo "Starting Free Cloudflare Tunnel to Nginx Gateway (http://127.0.0.1:8080)..."
+      pkill -f "cloudflared.*tunnel" 2>/dev/null || true
       if command -v cloudflared >/dev/null 2>&1; then
         cloudflared tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
         TUNNEL_PID=$!
       elif [ -f "$DIR/cloudflared" ]; then
         "$DIR/cloudflared" tunnel --url http://127.0.0.1:8080 > "$DIR/logs/cloudflared.log" 2>&1 &
         TUNNEL_PID=$!
+      fi
+
+      # Wait up to 6 seconds for tunnel origin URL to appear in logs
+      for i in $(seq 1 6); do
+        if [ -f "$DIR/logs/cloudflared.log" ]; then
+          TUNNEL_URL="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/logs/cloudflared.log" | tail -n1 || true)"
+          [ -n "$TUNNEL_URL" ] && break
+        fi
+        sleep 1
+      done
+
+      # If Cloudflare Pages project is configured, update backend tunnel origin
+      if [ -n "$TUNNEL_URL" ]; then
+        if [ -f "$DIR/cloudflare-pages/_worker.js" ]; then
+          sed -i "s|__TUNNEL_ORIGIN_PLACEHOLDER__|${TUNNEL_URL}|g" "$DIR/cloudflare-pages/_worker.js" 2>/dev/null || true
+        fi
+        if [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CF_PAGES_PROJECT:-}" ]; then
+          echo "Syncing active tunnel to Cloudflare Pages (${CF_PAGES_PROJECT})..."
+          curl -s -X PATCH "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${CF_PAGES_PROJECT}" \
+            -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "{\"deployment_configs\":{\"production\":{\"env_vars\":{\"BACKEND_TUNNEL_URL\":{\"value\":\"${TUNNEL_URL}\"}}}}}" >/dev/null 2>&1 || true
+        fi
       fi
     fi
   fi
@@ -460,16 +498,24 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   TARGET_ORIGIN="http://${LAN_IP}:8080"
   if [ "$HAS_NAMED_TUNNEL" = "true" ] && [ -n "$PUBLIC_DOMAIN" ]; then
     TARGET_ORIGIN="https://${PUBLIC_DOMAIN}"
+  elif [ "${TUNNEL_TYPE:-}" = "pages" ] || [[ "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
+    TARGET_ORIGIN="https://${PUBLIC_DOMAIN}"
+  elif [ -n "$TUNNEL_URL" ]; then
+    TARGET_ORIGIN="${TUNNEL_URL}"
   fi
+
   SB_TOKEN="${SUPABASE_MANAGEMENT_TOKEN:-}"
   SB_REF="${SUPABASE_PROJECT_REF:-}"
   if [ -n "$SB_TOKEN" ] && [ -n "$SB_REF" ]; then
     ALLOW_LIST="http://localhost:8080/**,http://localhost:5173/**,http://127.0.0.1:8080/**,http://${LAN_IP}:8080/**,http://${LAN_IP}/**"
-    if [ -n "$PUBLIC_DOMAIN" ]; then
+    if [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
       ALLOW_LIST="${ALLOW_LIST},https://${PUBLIC_DOMAIN}/**"
     fi
     if [ -n "$TARGET_ORIGIN" ]; then
       ALLOW_LIST="${ALLOW_LIST},${TARGET_ORIGIN}/**"
+    fi
+    if [ -n "$TUNNEL_URL" ]; then
+      ALLOW_LIST="${ALLOW_LIST},${TUNNEL_URL}/**"
     fi
     curl -s -X PATCH "https://api.supabase.com/v1/projects/${SB_REF}/config/auth" \
       -H "Authorization: Bearer ${SB_TOKEN}" \
@@ -481,10 +527,17 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   echo "==========================================================="
   echo "  StreamVault PRODUCTION GATEWAY is LIVE!                 "
   if [ "$HAS_NAMED_TUNNEL" = "true" ]; then
-    echo "  • Public Custom Domain:  https://${PUBLIC_DOMAIN}        "
+    echo "  • Public Custom Domain:      https://${PUBLIC_DOMAIN}        "
+  elif [ "${TUNNEL_TYPE:-}" = "pages" ] || [[ "$PUBLIC_DOMAIN" =~ \.pages\.dev$ ]]; then
+    echo "  • Free Cloudflare Pages URL: https://${PUBLIC_DOMAIN}        "
+    if [ -n "$TUNNEL_URL" ]; then
+      echo "  • Underlying Tunnel Origin:  ${TUNNEL_URL}                  "
+    fi
+  elif [ -n "$TUNNEL_URL" ]; then
+    echo "  • Free Quick Tunnel URL:     ${TUNNEL_URL}                  "
   fi
-  echo "  • Nginx Gateway (Local): http://localhost:8080           "
-  echo "  • Nginx Gateway (LAN):   http://${LAN_IP}:8080           "
+  echo "  • Nginx Gateway (Local):     http://localhost:8080           "
+  echo "  • Nginx Gateway (LAN):       http://${LAN_IP}:8080           "
   echo "  • Local Admin Panel:     http://127.0.0.1:4000           "
   echo "==========================================================="
 else

@@ -394,12 +394,20 @@ frontend_env_origin = os.getenv("FRONTEND_ORIGIN")
 if frontend_env_origin and frontend_env_origin not in ALLOWED_ORIGINS:
     ALLOWED_ORIGINS.append(frontend_env_origin.strip())
 
+if settings.PUBLIC_DOMAIN:
+    pub_dom = settings.PUBLIC_DOMAIN.strip().lower()
+    for scheme in ("https://", "http://"):
+        origin_candidate = f"{scheme}{pub_dom}"
+        if origin_candidate not in ALLOWED_ORIGINS:
+            ALLOWED_ORIGINS.append(origin_candidate)
+
 
 class DynamicCORSMiddleware(CORSMiddleware):
     """
     Statically allows approved origins and LAN subnets.
     Only allows a trycloudflare.com origin if it matches THIS host's active tunnel,
     rejecting any third-party attacker-controlled *.trycloudflare.com tunnels.
+    Also validates any configured public domain (e.g. *.pages.dev).
     """
     def is_allowed_origin(self, origin: str) -> bool:
         if super().is_allowed_origin(origin):
@@ -408,6 +416,8 @@ class DynamicCORSMiddleware(CORSMiddleware):
             active_tunnel = get_active_cloudflared_origin()
             if active_tunnel and origin.rstrip("/") == active_tunnel.rstrip("/"):
                 return True
+        if origin and settings.PUBLIC_DOMAIN and settings.PUBLIC_DOMAIN.lower() in origin.lower():
+            return True
         return False
 
 

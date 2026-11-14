@@ -531,29 +531,98 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
   PUBLIC_DOMAIN="${PUBLIC_DOMAIN:-localhost}"
   FRONTEND_ORIGIN="${FRONTEND_ORIGIN:-http://localhost:${NGINX_PORT}}"
 
-  if [ "$DEPLOY_MODE" = "2" ]; then
-    echo ""
-    echo -e "${CYAN}${BOLD}=== Cloudflare Authenticated Named Tunnel Provisioning ===${NC}"
-
+  install_cloudflared() {
     if ! command -v cloudflared >/dev/null 2>&1; then
       info "Installing official Cloudflare Tunnel daemon (cloudflared) for ${OS_TYPE}/${ARCH}..."
       if [ "$OS_TYPE" = "Darwin" ]; then
         brew install cloudflare/cloudflare/cloudflared
       elif [ "$PKG_MGR" = "apt" ]; then
-        CF_DEB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
-        CF_TMP_DIR=$(mktemp -d /tmp/cf_deb_XXXXXX)
-        chmod 700 "$CF_TMP_DIR"
-        CF_DEB_PATH="${CF_TMP_DIR}/cloudflared.deb"
-        curl -fsSL "$CF_DEB_URL" -o "$CF_DEB_PATH"
-        $SUDO dpkg -i "$CF_DEB_PATH"
-        rm -rf "$CF_TMP_DIR"
+        local cf_deb_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
+        local cf_tmp_dir
+        cf_tmp_dir=$(mktemp -d /tmp/cf_deb_XXXXXX)
+        chmod 700 "$cf_tmp_dir"
+        local cf_deb_path="${cf_tmp_dir}/cloudflared.deb"
+        curl -fsSL "$cf_deb_url" -o "$cf_deb_path"
+        $SUDO dpkg -i "$cf_deb_path"
+        rm -rf "$cf_tmp_dir"
       else
-        CF_BIN_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
-        $SUDO curl -fsSL "$CF_BIN_URL" -o /usr/local/bin/cloudflared
+        local cf_bin_url="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
+        $SUDO curl -fsSL "$cf_bin_url" -o /usr/local/bin/cloudflared
         $SUDO chmod +x /usr/local/bin/cloudflared
       fi
     fi
-    success "cloudflared ready: $(cloudflared --version)"
+    success "cloudflared ready: $(cloudflared --version 2>/dev/null || echo 'installed')"
+  }
+
+  if [ "$DEPLOY_MODE" = "1" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}Free Cloudflare Public Access (No Custom Domain Required):${NC}"
+    echo "  Would you like to bind this localhost server to the internet using a free Cloudflare domain/tunnel?"
+    echo "  This allows anyone on the internet to stream securely from your server via HTTPS without owning a domain."
+    read -r -p "Enable Free Cloudflare Public Access? [y/N]: " ENABLE_FREE_CF
+    ENABLE_FREE_CF="${ENABLE_FREE_CF:-N}"
+
+    if [[ "$ENABLE_FREE_CF" =~ ^[Yy]$ ]]; then
+      ENABLE_TUNNEL="true"
+      save_answer "ENABLE_TUNNEL" "true"
+
+      echo ""
+      echo -e "${BOLD}Select Free Cloudflare Domain Method:${NC}"
+      echo "  1) Cloudflare Quick Tunnel (*.trycloudflare.com) [Automatic, Zero Setup, Instant HTTPS URL]"
+      echo "  2) Cloudflare Pages (*.pages.dev)               [Permanent Custom Subdomain e.g. https://myvault.pages.dev]"
+      read -r -p "Select Free Method [1 or 2, Default: 1]: " FREE_CF_METHOD
+      FREE_CF_METHOD="${FREE_CF_METHOD:-1}"
+      save_answer "FREE_CF_METHOD" "$FREE_CF_METHOD"
+
+      install_cloudflared
+
+      if [ "$FREE_CF_METHOD" = "2" ]; then
+        TUNNEL_TYPE="pages"
+        echo ""
+        echo -e "${CYAN}Cloudflare Pages (.pages.dev) Configuration:${NC}"
+        echo "Enter your desired or existing Cloudflare Pages project name."
+        echo "(For example, entering 'streamvault' maps to https://streamvault.pages.dev)"
+        read -r -p "Pages Project Name [Default: streamvault]: " CF_PAGES_NAME
+        CF_PAGES_NAME="$(echo "${CF_PAGES_NAME:-streamvault}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
+        PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+        FRONTEND_ORIGIN="https://${PUBLIC_DOMAIN}"
+        CF_PAGES_PROJECT="$CF_PAGES_NAME"
+        save_answer "PUBLIC_DOMAIN" "$PUBLIC_DOMAIN"
+        save_answer "FRONTEND_ORIGIN" "$FRONTEND_ORIGIN"
+        save_answer "TUNNEL_TYPE" "pages"
+        save_answer "CF_PAGES_PROJECT" "$CF_PAGES_PROJECT"
+
+        echo ""
+        echo -e "${YELLOW}Optional Automated Cloudflare Pages Sync:${NC}"
+        echo "If you provide your Cloudflare Account ID and API Token, StreamVault can automatically"
+        echo "update your Cloudflare Pages target tunnel whenever the server starts."
+        read -r -p "Cloudflare Account ID (press Enter to skip): " CF_ACCOUNT_ID
+        if [ -n "$CF_ACCOUNT_ID" ]; then
+          read -r -p "Cloudflare API Token (with Pages edit permissions): " CF_API_TOKEN
+          save_answer "CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT_ID"
+          save_answer "CLOUDFLARE_API_TOKEN" "$CF_API_TOKEN"
+        fi
+        success "Cloudflare Pages configured for https://${PUBLIC_DOMAIN}."
+        echo -e "Deployment worker template is available at ${CYAN}${TARGET_DIR}/cloudflare-pages/_worker.js${NC}"
+      else
+        TUNNEL_TYPE="quick"
+        PUBLIC_DOMAIN="trycloudflare.com"
+        FRONTEND_ORIGIN=""
+        save_answer "PUBLIC_DOMAIN" "trycloudflare.com"
+        save_answer "FRONTEND_ORIGIN" ""
+        save_answer "TUNNEL_TYPE" "quick"
+        success "Cloudflare Quick Tunnel enabled (automatic *.trycloudflare.com URL)."
+      fi
+    else
+      ENABLE_TUNNEL="false"
+      TUNNEL_TYPE="none"
+      save_answer "ENABLE_TUNNEL" "false"
+      save_answer "TUNNEL_TYPE" "none"
+    fi
+  elif [ "$DEPLOY_MODE" = "2" ]; then
+    echo ""
+    echo -e "${CYAN}${BOLD}=== Cloudflare Authenticated Named Tunnel Provisioning ===${NC}"
+    install_cloudflared
 
     CF_CERT_PATH="${HOME}/.cloudflared/cert.pem"
     if [ -f "$CF_CERT_PATH" ]; then
@@ -694,6 +763,11 @@ ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET}
 FRONTEND_ORIGIN=${FRONTEND_ORIGIN}
 PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
 MEDIA_DIR=${MEDIA_DIR}
+ENABLE_TUNNEL=${ENABLE_TUNNEL:-false}
+TUNNEL_TYPE=${TUNNEL_TYPE:-none}
+CF_PAGES_PROJECT=${CF_PAGES_PROJECT:-}
+CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
+CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
 
 # --- Hardware Resource Governor Defaults ---
 DEFAULT_ALLOCATED_CPU_CORES=${USER_CPU_THREADS}
@@ -705,12 +779,17 @@ EOF
     success "Created secured .env configuration."
   else
     ( umask 077 && touch "${ENV_FILE}.tmp" && chmod 600 "${ENV_FILE}.tmp" )
-    grep -vE '^(FRONTEND_ORIGIN|PUBLIC_DOMAIN|MEDIA_DIR|VITE_MEDIA_SERVER_URL|DEFAULT_ALLOCATED_CPU_CORES|DEFAULT_ALLOCATED_RAM_MB|DEFAULT_GPU_ENABLED|DEFAULT_TRANSCODING_ENABLED)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
+    grep -vE '^(FRONTEND_ORIGIN|PUBLIC_DOMAIN|MEDIA_DIR|VITE_MEDIA_SERVER_URL|ENABLE_TUNNEL|TUNNEL_TYPE|CF_PAGES_PROJECT|CLOUDFLARE_ACCOUNT_ID|CLOUDFLARE_API_TOKEN|DEFAULT_ALLOCATED_CPU_CORES|DEFAULT_ALLOCATED_RAM_MB|DEFAULT_GPU_ENABLED|DEFAULT_TRANSCODING_ENABLED)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
     cat >> "${ENV_FILE}.tmp" <<EOF
 VITE_MEDIA_SERVER_URL=
 FRONTEND_ORIGIN=${FRONTEND_ORIGIN}
 PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
 MEDIA_DIR=${MEDIA_DIR}
+ENABLE_TUNNEL=${ENABLE_TUNNEL:-false}
+TUNNEL_TYPE=${TUNNEL_TYPE:-none}
+CF_PAGES_PROJECT=${CF_PAGES_PROJECT:-}
+CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID:-}
+CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN:-}
 DEFAULT_ALLOCATED_CPU_CORES=${USER_CPU_THREADS}
 DEFAULT_ALLOCATED_RAM_MB=${USER_RAM_MB}
 DEFAULT_GPU_ENABLED=${USER_GPU_ENABLED}
@@ -1012,13 +1091,32 @@ echo "  • Multi-Bitrate ABR  : ${USER_ABR_ENABLED:-false}"
 echo ""
 
 if [ "${DEPLOY_MODE:-1}" = "1" ]; then
-  echo -e "${CYAN}${BOLD}Local / LAN Access Links:${NC}"
-  echo -e "  • ${BOLD}StreamVault Web App (Local):${NC}   ${GREEN}http://localhost:${NGINX_PORT:-8080}${NC}"
-  echo -e "  • ${BOLD}StreamVault Web App (LAN):${NC}     ${GREEN}http://${LAN_IP}:${NGINX_PORT:-8080}${NC}"
-  echo -e "  • ${BOLD}Local Admin Operations Panel:${NC}  ${YELLOW}http://127.0.0.1:4000${NC} (Strictly Local)"
-  echo ""
-  echo -e "${BOLD}Supabase Redirect URL to Whitelist:${NC}"
-  echo "  • http://localhost:${NGINX_PORT:-8080}/**"
+  if [ "${ENABLE_TUNNEL:-false}" = "true" ]; then
+    echo -e "${CYAN}${BOLD}Free Cloudflare Public Access Links:${NC}"
+    if [ "${TUNNEL_TYPE:-}" = "pages" ] || [[ "${PUBLIC_DOMAIN:-}" =~ \.pages\.dev$ ]]; then
+      echo -e "  • ${BOLD}Free Public Web App URL:${NC}      ${GREEN}https://${PUBLIC_DOMAIN}${NC}"
+      echo -e "  • ${BOLD}Cloudflare Pages Worker:${NC}      ${TARGET_DIR}/cloudflare-pages/_worker.js"
+      echo -e "  • ${BOLD}Setup & Deploy Guide:${NC}         ${TARGET_DIR}/cloudflare-pages/README.md"
+    else
+      echo -e "  • ${BOLD}Cloudflare Quick Tunnel:${NC}    ${GREEN}Active (Check terminal logs or run './start.sh status')${NC}"
+    fi
+    echo -e "  • ${BOLD}Local Web App (LAN):${NC}          ${GREEN}http://${LAN_IP}:${NGINX_PORT:-8080}${NC}"
+    echo -e "  • ${BOLD}Local Admin Operations Panel:${NC} ${YELLOW}http://127.0.0.1:4000${NC} (Strictly Local)"
+    echo ""
+    echo -e "${BOLD}Supabase Redirect URLs to Whitelist (Authentication -> URL Configuration):${NC}"
+    echo "  • http://localhost:${NGINX_PORT:-8080}/**"
+    if [ -n "$PUBLIC_DOMAIN" ] && [ "$PUBLIC_DOMAIN" != "trycloudflare.com" ] && [ "$PUBLIC_DOMAIN" != "localhost" ]; then
+      echo -e "  • ${GREEN}https://${PUBLIC_DOMAIN}/**${NC}"
+    fi
+  else
+    echo -e "${CYAN}${BOLD}Local / LAN Access Links:${NC}"
+    echo -e "  • ${BOLD}StreamVault Web App (Local):${NC}   ${GREEN}http://localhost:${NGINX_PORT:-8080}${NC}"
+    echo -e "  • ${BOLD}StreamVault Web App (LAN):${NC}     ${GREEN}http://${LAN_IP}:${NGINX_PORT:-8080}${NC}"
+    echo -e "  • ${BOLD}Local Admin Operations Panel:${NC}  ${YELLOW}http://127.0.0.1:4000${NC} (Strictly Local)"
+    echo ""
+    echo -e "${BOLD}Supabase Redirect URL to Whitelist:${NC}"
+    echo "  • http://localhost:${NGINX_PORT:-8080}/**"
+  fi
 else
   echo -e "${CYAN}${BOLD}Production / Self-Hosted Access Links:${NC}"
   echo -e "  • ${BOLD}Public Web App URL:${NC}            ${GREEN}https://${PUBLIC_DOMAIN}${NC}"
