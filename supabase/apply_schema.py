@@ -96,13 +96,59 @@ def run_via_management_api(project_ref: str, token: str, sql_content: str) -> tu
             return False, f"Request error: {e}"
 
 
+COMMON_REGIONS = [
+    "ap-northeast-1", "ap-southeast-1", "ap-south-1",
+    "us-east-1", "us-west-1", "eu-central-1", "eu-west-1",
+    "ca-central-1", "ap-southeast-2", "sa-east-1",
+    "ap-northeast-2", "eu-west-2", "eu-west-3"
+]
+
+
+def detect_supabase_region(project_ref: str) -> str:
+    """Attempt detecting Supabase project region from db host IP geolocation."""
+    try:
+        import socket
+        info = socket.getaddrinfo(f"db.{project_ref}.supabase.co", 5432)
+        ip = info[0][4][0]
+        if ":" in ip: # IPv6
+            import urllib.request
+            req = urllib.request.Request(f"https://ipinfo.io/{ip}/json", headers={"User-Agent": "curl/7.68.0"})
+            with urllib.request.urlopen(req, timeout=3.0) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                country = data.get("country", "").upper()
+                city = data.get("city", "")
+                if country == "JP" or "Tokyo" in city:
+                    return "ap-northeast-1"
+                if country == "KR" or "Seoul" in city:
+                    return "ap-northeast-2"
+                if country == "SG" or "Singapore" in city:
+                    return "ap-southeast-1"
+                if country == "IN" or "Mumbai" in city:
+                    return "ap-south-1"
+                if country == "DE" or "Frankfurt" in city:
+                    return "eu-central-1"
+                if country == "IE" or "Dublin" in city:
+                    return "eu-west-1"
+                if country == "GB" or "London" in city:
+                    return "eu-west-2"
+                if country == "US":
+                    region_name = data.get("region", "")
+                    if "California" in region_name or "Oregon" in region_name:
+                        return "us-west-1"
+                    return "us-east-1"
+    except Exception:
+        pass
+    return ""
+
+
 def run_via_postgres_connection(conn_str_or_pwd: str, project_ref: str, sql_content: str) -> tuple[bool, str]:
     """Execute SQL via PostgreSQL connection using pg8000 or psql."""
     if not pg8000:
         return False, "pg8000 python library is not installed in the current environment."
 
     # Parse connection parameters
-    if conn_str_or_pwd.startswith("postgres://") or conn_str_or_pwd.startswith("postgresql://"):
+    is_uri = conn_str_or_pwd.startswith("postgres://") or conn_str_or_pwd.startswith("postgresql://")
+    if is_uri:
         parsed = urllib.parse.urlparse(conn_str_or_pwd)
         user = parsed.username or "postgres"
         password = parsed.password or ""
@@ -121,7 +167,8 @@ def run_via_postgres_connection(conn_str_or_pwd: str, project_ref: str, sql_cont
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
 
-    # Attempt connection
+    # Step 1: Attempt direct connection (shorter timeout to fail fast on IPv6-unreachable networks)
+    direct_timeout = 8 if not is_uri else 25
     try:
         print(f"Connecting to Postgres at {host}:{port}...")
         conn = pg8000.native.Connection(
@@ -131,24 +178,51 @@ def run_via_postgres_connection(conn_str_or_pwd: str, project_ref: str, sql_cont
             port=port,
             database=database,
             ssl_context=ctx,
-            timeout=30
+            timeout=direct_timeout
         )
         print("Connected! Executing schema script (this may take 5-15 seconds)...")
         conn.run(sql_content)
         conn.close()
         return True, "Executed successfully via PostgreSQL direct connection."
     except Exception as e:
-        err_msg = str(e)
-        # Check if direct connection failed due to IPv6 unreachable network
-        if "Network is unreachable" in err_msg or "Errno 101" in err_msg or "timed out" in err_msg:
-            return False, (
-                f"Connection to direct host {host}:{port} failed ({err_msg}).\n"
-                "Note: Direct Supabase host (db.<ref>.supabase.co) requires an IPv6 network.\n"
-                "If your server is on an IPv4-only network, use your Supabase Session Pooler connection string\n"
-                "(Supabase Dashboard -> Connect -> Session mode, e.g. postgres://postgres.<ref>:<pwd>@aws-<region>.pooler.supabase.com:5432/postgres)\n"
-                "or your Supabase Personal Access Token (sbp_...)."
+        direct_err = str(e)
+        print(f"[NOTE] Direct connection to {host}:{port} unavailable: {direct_err}")
+
+    # If this was already a custom pooler URI or explicit host, return the error
+    if is_uri and "pooler.supabase.com" in host:
+        return False, f"PostgreSQL pooler error: {direct_err}"
+
+    # Step 2: Automatic IPv4 Supavisor connection pooler fallback
+    print("Attempting automatic IPv4 Supavisor connection pooler fallback...")
+    detected_region = detect_supabase_region(project_ref)
+    candidate_regions = ([detected_region] if detected_region else []) + [r for r in COMMON_REGIONS if r != detected_region]
+
+    for region in candidate_regions:
+        pooler_host = f"aws-0-{region}.pooler.supabase.com"
+        pooler_user = f"postgres.{project_ref}"
+        try:
+            print(f"Trying IPv4 connection pooler ({region})...")
+            conn = pg8000.native.Connection(
+                user=pooler_user,
+                password=password,
+                host=pooler_host,
+                port=5432,
+                database="postgres",
+                ssl_context=ctx,
+                timeout=5
             )
-        return False, f"PostgreSQL error: {err_msg}"
+            print(f"Connected successfully via {region} pooler! Executing schema script...")
+            conn.run(sql_content)
+            conn.close()
+            return True, f"Executed successfully via Supabase {region} connection pooler."
+        except Exception:
+            continue
+
+    return False, (
+        f"Could not connect to database via direct host ({direct_err}) or candidate IPv4 poolers.\n"
+        "Please check your database password or provide your exact Supabase Session Pooler connection string\n"
+        "(Supabase Dashboard -> Connect -> Session mode, e.g. postgres://postgres.<ref>:<pwd>@aws-<region>.pooler.supabase.com:5432/postgres)."
+    )
 
 
 def main():
@@ -226,3 +300,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
