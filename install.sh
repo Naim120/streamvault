@@ -63,6 +63,74 @@ save_answer() {
   echo "${key}=\"${val}\"" >> "$ANSWERS_FILE"
 }
 
+parse_cf_json() {
+  local json_str="$1"
+  local field="$2"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c '
+import sys, json
+try:
+    raw = sys.argv[1]
+    try:
+        data = json.loads(raw)
+    except Exception:
+        import codecs
+        data = json.loads(codecs.decode(raw, "unicode_escape"))
+    field = sys.argv[2]
+    if field == "success":
+        print("true" if data.get("success") is True else "false")
+    elif field == "subdomain":
+        res = data.get("result")
+        if isinstance(res, dict):
+            print(res.get("subdomain") or "")
+        else:
+            print("")
+    elif field == "error_code":
+        errs = data.get("errors") or []
+        if errs and isinstance(errs, list) and isinstance(errs[0], dict):
+            print(str(errs[0].get("code", "")))
+        else:
+            print("")
+    elif field == "error_msg":
+        errs = data.get("errors") or []
+        if errs and isinstance(errs, list) and isinstance(errs[0], dict):
+            print(str(errs[0].get("message", "")))
+        elif data.get("messages") and isinstance(data["messages"], list):
+            print(str(data["messages"][0]))
+        else:
+            print("")
+    elif field == "projects":
+        res = data.get("result") or []
+        if isinstance(res, list):
+            for p in res:
+                if isinstance(p, dict) and p.get("name"):
+                    name = str(p.get("name"))
+                    sub = str(p.get("subdomain") or f"{name}.pages.dev")
+                    print(f"{name}|{sub}")
+except Exception:
+    pass
+' "$json_str" "$field" 2>/dev/null
+  elif command -v jq >/dev/null 2>&1; then
+    case "$field" in
+      success)
+        echo "$json_str" | jq -r 'if .success == true then "true" else "false" end' 2>/dev/null || echo "false"
+        ;;
+      subdomain)
+        echo "$json_str" | jq -r '.result.subdomain // empty' 2>/dev/null || true
+        ;;
+      error_code)
+        echo "$json_str" | jq -r '.errors[0].code // empty' 2>/dev/null || true
+        ;;
+      error_msg)
+        echo "$json_str" | jq -r '.errors[0].message // .messages[0] // empty' 2>/dev/null || true
+        ;;
+      projects)
+        echo "$json_str" | jq -r '.result[]? | "\(.name)|\(.subdomain // "\(.name).pages.dev")"' 2>/dev/null || true
+        ;;
+    esac
+  fi
+}
+
 handle_interrupt() {
   local exit_code=$?
   # If installation is already marked complete, exit cleanly without error
@@ -591,10 +659,104 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
         echo "Names like 'streamvault' are already registered by other users."
         echo ""
 
-        read -r -p "Cloudflare Account ID (from your dash.cloudflare.com URL): " CF_ACCOUNT_ID
-        read -r -p "Cloudflare API Token (with Cloudflare Pages: Edit permissions): " CF_API_TOKEN
+        read -r -p "Cloudflare Account ID (from your dash.cloudflare.com URL) [${CLOUDFLARE_ACCOUNT_ID:-}]: " INPUT_CF_ACCOUNT_ID
+        CF_ACCOUNT_ID="${INPUT_CF_ACCOUNT_ID:-${CLOUDFLARE_ACCOUNT_ID:-}}"
+        read -r -p "Cloudflare API Token (with Cloudflare Pages: Edit permissions) [${CLOUDFLARE_API_TOKEN:-}]: " INPUT_CF_API_TOKEN
+        CF_API_TOKEN="${INPUT_CF_API_TOKEN:-${CLOUDFLARE_API_TOKEN:-}}"
+
+        # 1. Sanitize CF_ACCOUNT_ID (strip whitespace/quotes, extract 32-char hex if full URL was pasted)
+        CF_ACCOUNT_ID="$(echo "${CF_ACCOUNT_ID}" | tr -d ' "' | tr -d "'")"
+        extracted_cf_hex="$(echo "$CF_ACCOUNT_ID" | grep -oE '[a-fA-F0-9]{32}' | head -n1 || true)"
+        [ -n "$extracted_cf_hex" ] && CF_ACCOUNT_ID="$extracted_cf_hex"
+
+        # 2. Sanitize CF_API_TOKEN (strip whitespace/quotes)
+        CF_API_TOKEN="$(echo "${CF_API_TOKEN}" | tr -d ' "' | tr -d "'")"
+
+        # Immediately export to global variables so Step 5 writes them into .env
+        CLOUDFLARE_ACCOUNT_ID="$CF_ACCOUNT_ID"
+        CLOUDFLARE_API_TOKEN="$CF_API_TOKEN"
+        save_answer "CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_ACCOUNT_ID"
+        save_answer "CLOUDFLARE_API_TOKEN" "$CLOUDFLARE_API_TOKEN"
 
         while true; do
+          existing_projects=()
+          num_projects=0
+
+          if [ -n "$CF_ACCOUNT_ID" ] && [ -n "$CF_API_TOKEN" ]; then
+            info "Querying Cloudflare Pages projects in account ${CF_ACCOUNT_ID}..."
+            list_resp="$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" 2>/dev/null || true)"
+
+            if [ "$(parse_cf_json "$list_resp" "success")" = "true" ]; then
+              while IFS= read -r p_line; do
+                [ -n "$p_line" ] && existing_projects+=("$p_line")
+              done < <(parse_cf_json "$list_resp" "projects")
+              num_projects="${#existing_projects[@]}"
+            else
+              api_err="$(parse_cf_json "$list_resp" "error_msg")"
+              [ -n "$api_err" ] && warn "Cloudflare Pages API: $api_err"
+            fi
+          fi
+
+          if [ "$num_projects" -gt 0 ]; then
+            echo ""
+            echo -e "${GREEN}${BOLD}Found ${num_projects} Cloudflare Pages project(s) in your account:${NC}"
+            p_idx=1
+            for p_entry in "${existing_projects[@]}"; do
+              p_name="${p_entry%%|*}"
+              p_sub="${p_entry##*|}"
+              echo -e "  ${BOLD}${p_idx})${NC} ${CYAN}${p_name}${NC} (${p_sub})"
+              p_idx=$((p_idx + 1))
+            done
+            echo ""
+            echo -e "${BOLD}Project Management Options:${NC}"
+            echo "  • Enter 1-${num_projects} to select and use an existing project"
+            echo "  • Enter [N] to create a brand-new Pages project name"
+            echo "  • Enter [D] to delete unused test project(s) from your Cloudflare account"
+            echo "  • Enter [Q] to switch to Cloudflare Quick Tunnel (*.trycloudflare.com)"
+            read -r -p "Select option [1-${num_projects}, N, D, or Q, Default: 1]: " PROJ_CHOICE
+            PROJ_CHOICE="${PROJ_CHOICE:-1}"
+
+            if [[ "$PROJ_CHOICE" =~ ^[0-9]+$ ]] && [ "$PROJ_CHOICE" -ge 1 ] && [ "$PROJ_CHOICE" -le "$num_projects" ]; then
+              chosen_entry="${existing_projects[$((PROJ_CHOICE - 1))]}"
+              CF_PAGES_NAME="${chosen_entry%%|*}"
+              PUBLIC_DOMAIN="${chosen_entry##*|}"
+              success "Selected existing Cloudflare Pages project '${CF_PAGES_NAME}' (${PUBLIC_DOMAIN})!"
+              break
+            elif [[ "$PROJ_CHOICE" =~ ^[Dd]$ ]]; then
+              echo ""
+              read -r -p "Enter the number (1-${num_projects}) or exact name of the project to delete: " DEL_CHOICE
+              del_name=""
+              if [[ "$DEL_CHOICE" =~ ^[0-9]+$ ]] && [ "$DEL_CHOICE" -ge 1 ] && [ "$DEL_CHOICE" -le "$num_projects" ]; then
+                del_entry="${existing_projects[$((DEL_CHOICE - 1))]}"
+                del_name="${del_entry%%|*}"
+              else
+                del_name="$(echo "$DEL_CHOICE" | tr -d ' ')"
+              fi
+
+              if [ -n "$del_name" ]; then
+                read -r -p "Are you sure you want to permanently DELETE '${del_name}' from Cloudflare? [y/N]: " CONFIRM_DEL
+                if [[ "$CONFIRM_DEL" =~ ^[Yy]$ ]]; then
+                  info "Deleting Cloudflare Pages project '${del_name}'..."
+                  del_resp="$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${del_name}" \
+                    -H "Authorization: Bearer ${CF_API_TOKEN}" \
+                    -H "Content-Type: application/json" 2>/dev/null || true)"
+                  if [ "$(parse_cf_json "$del_resp" "success")" = "true" ]; then
+                    success "Project '${del_name}' deleted successfully from Cloudflare."
+                  else
+                    del_err="$(parse_cf_json "$del_resp" "error_msg")"
+                    warn "Could not delete '${del_name}': ${del_err:-Unknown error}"
+                  fi
+                fi
+              fi
+              continue
+            elif [[ "$PROJ_CHOICE" =~ ^[Qq]$ ]]; then
+              FREE_CF_METHOD="1"
+              break
+            fi
+          fi
+
           read -r -p "Enter a unique Pages Project Name (e.g. streamvault-zoya): " CF_PAGES_NAME
           CF_PAGES_NAME="$(echo "${CF_PAGES_NAME}" | tr '[:upper:]' '[:lower:]' | tr -cd 'a-z0-9-')"
           if [ -z "$CF_PAGES_NAME" ] || [ "$CF_PAGES_NAME" = "streamvault" ]; then
@@ -604,30 +766,36 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
 
           if [ -n "$CF_ACCOUNT_ID" ] && [ -n "$CF_API_TOKEN" ]; then
             info "Verifying & provisioning project '${CF_PAGES_NAME}' in your Cloudflare account..."
+            # 1. First check if project already exists in this account
+            cf_existing="$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PAGES_NAME}" \
+              -H "Authorization: Bearer ${CF_API_TOKEN}" \
+              -H "Content-Type: application/json" 2>/dev/null || true)"
+
+            if [ "$(parse_cf_json "$cf_existing" "success")" = "true" ]; then
+              cf_subdomain="$(parse_cf_json "$cf_existing" "subdomain")"
+              [ -n "$cf_subdomain" ] && PUBLIC_DOMAIN="$cf_subdomain" || PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
+              success "Found existing Cloudflare Pages project '${CF_PAGES_NAME}' in your account (${PUBLIC_DOMAIN})!"
+              break
+            fi
+
+            # 2. Project does not exist, send POST to create it
+            info "Provisioning new project '${CF_PAGES_NAME}'..."
             cf_resp="$(curl -s -X POST "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects" \
               -H "Authorization: Bearer ${CF_API_TOKEN}" \
               -H "Content-Type: application/json" \
               -d "{\"name\":\"${CF_PAGES_NAME}\",\"production_branch\":\"main\"}" 2>/dev/null || true)"
 
-            cf_success="$(echo "$cf_resp" | grep -o '"success":true' || true)"
-            if [ -n "$cf_success" ]; then
-              cf_subdomain="$(echo "$cf_resp" | grep -oE '"subdomain":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
+            if [ "$(parse_cf_json "$cf_resp" "success")" = "true" ]; then
+              cf_subdomain="$(parse_cf_json "$cf_resp" "subdomain")"
               [ -n "$cf_subdomain" ] && PUBLIC_DOMAIN="$cf_subdomain" || PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
-              success "Cloudflare Pages project '${CF_PAGES_NAME}' created in your account (${PUBLIC_DOMAIN})!"
+              success "Cloudflare Pages project '${CF_PAGES_NAME}' ready at https://${PUBLIC_DOMAIN}!"
               break
             else
-              # Check if project already exists in this account
-              cf_existing="$(curl -s -X GET "https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/pages/projects/${CF_PAGES_NAME}" \
-                -H "Authorization: Bearer ${CF_API_TOKEN}" 2>/dev/null || true)"
-              if echo "$cf_existing" | grep -q '"success":true'; then
-                cf_subdomain="$(echo "$cf_existing" | grep -oE '"subdomain":"[^"]+"' | head -n1 | cut -d'"' -f4 || true)"
-                [ -n "$cf_subdomain" ] && PUBLIC_DOMAIN="$cf_subdomain" || PUBLIC_DOMAIN="${CF_PAGES_NAME}.pages.dev"
-                success "Found existing Cloudflare Pages project '${CF_PAGES_NAME}' in your account (${PUBLIC_DOMAIN})!"
-                break
-              fi
+              cf_code="$(parse_cf_json "$cf_resp" "error_code")"
+              cf_err="$(parse_cf_json "$cf_resp" "error_msg")"
+              [ -z "$cf_err" ] && cf_err="$cf_resp"
+              warn "Cloudflare API response (${cf_code:-error}): $cf_err"
 
-              cf_err="$(echo "$cf_resp" | grep -oE '"message":"[^"]+"' | head -n1 | cut -d'"' -f4 || echo "$cf_resp")"
-              warn "Cloudflare API response: $cf_err"
               echo "Would you like to try another name, or switch to instant Cloudflare Quick Tunnel?"
               echo "  1) Try another project name"
               echo "  2) Switch to Cloudflare Quick Tunnel (*.trycloudflare.com)"
@@ -653,8 +821,8 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
           save_answer "FRONTEND_ORIGIN" "$FRONTEND_ORIGIN"
           save_answer "TUNNEL_TYPE" "pages"
           save_answer "CF_PAGES_PROJECT" "$CF_PAGES_PROJECT"
-          save_answer "CLOUDFLARE_ACCOUNT_ID" "$CF_ACCOUNT_ID"
-          save_answer "CLOUDFLARE_API_TOKEN" "$CF_API_TOKEN"
+          save_answer "CLOUDFLARE_ACCOUNT_ID" "$CLOUDFLARE_ACCOUNT_ID"
+          save_answer "CLOUDFLARE_API_TOKEN" "$CLOUDFLARE_API_TOKEN"
           success "Cloudflare Pages configured for https://${PUBLIC_DOMAIN}."
         fi
       fi
@@ -847,6 +1015,9 @@ EOF
     if [ -f "$ENV_FILE" ]; then
       existing_port="$(grep '^MEDIA_SERVER_PORT=' "$ENV_FILE" | cut -d'=' -f2 | tr -d ' "' || true)"
       [ -n "$existing_port" ] && API_PORT="$existing_port"
+      [ -z "${CLOUDFLARE_ACCOUNT_ID:-}" ] && CLOUDFLARE_ACCOUNT_ID="$(grep '^CLOUDFLARE_ACCOUNT_ID=' "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)"
+      [ -z "${CLOUDFLARE_API_TOKEN:-}" ] && CLOUDFLARE_API_TOKEN="$(grep '^CLOUDFLARE_API_TOKEN=' "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)"
+      [ -z "${CF_PAGES_PROJECT:-}" ] && CF_PAGES_PROJECT="$(grep '^CF_PAGES_PROJECT=' "$ENV_FILE" | cut -d'=' -f2- | tr -d ' "' || true)"
     fi
     if [ "$API_PORT" = "8000" ] && (echo > /dev/tcp/127.0.0.1/8000) 2>/dev/null; then
       if ! pgrep -f "uvicorn app.main:app" >/dev/null 2>&1; then

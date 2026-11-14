@@ -10,6 +10,28 @@ export default {
     // Target origin from Pages environment variable or fallback placeholder
     const targetOrigin = (env.BACKEND_TUNNEL_URL || "__TUNNEL_ORIGIN_PLACEHOLDER__").replace(/\/$/, "");
 
+    // 1. Serve static frontend assets via Cloudflare Pages edge cache if available
+    const isBackendPath = url.pathname.startsWith("/api/") || 
+                          url.pathname.startsWith("/media/") || 
+                          url.pathname === "/sitemap.xml";
+
+    if (!isBackendPath && env.ASSETS) {
+      try {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) {
+          return assetResponse;
+        }
+        // SPA fallback: route to index.html for client-side routing
+        const spaRequest = new Request(new URL("/", request.url), request);
+        const spaResponse = await env.ASSETS.fetch(spaRequest);
+        if (spaResponse.ok) {
+          return spaResponse;
+        }
+      } catch (_) {
+        // Fall through to backend proxy if edge asset lookup fails
+      }
+    }
+
     if (!targetOrigin || targetOrigin.includes("PLACEHOLDER")) {
       return new Response(
         `<!DOCTYPE html>

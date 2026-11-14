@@ -50,6 +50,8 @@ ALLOWED_ORIGIN_REGEX = re.compile(
     r"https?://192\.168\.\d+\.\d+(:\d+)?|"
     r"https?://10\.\d+\.\d+\.\d+(:\d+)?|"
     r"https?://172\.(1[6-9]|2\d|3[01])\.\d+\.\d+(:\d+)?|"
+    r"https://[a-zA-Z0-9_.-]+\.pages\.dev(:\d+)?|"
+    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com(:\d+)?|"
     r"capacitor://localhost)$"
 )
 
@@ -129,6 +131,11 @@ def _is_allowed(candidate: str) -> bool:
             if pub_domain and host_name == pub_domain:
                 return True
             return False
+
+        # If candidate is a pages.dev domain, validate against allowed regex
+        if "pages.dev" in host_name:
+            if ALLOWED_ORIGIN_REGEX.match(base):
+                return True
 
         # If public domain or public site URL is configured, require match
         pub_domain = (os.environ.get("PUBLIC_DOMAIN") or getattr(settings, "PUBLIC_DOMAIN", None) or "").strip().rstrip("/")

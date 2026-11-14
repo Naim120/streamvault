@@ -109,6 +109,8 @@ ALLOWED_ORIGIN_REGEX = re.compile(
     r"https?://192\.168\.\d+\.\d+(:\d+)?|"
     r"https?://10\.\d+\.\d+\.\d+(:\d+)?|"
     r"https?://172\.(1[6-9]|2\d|3[01])\.\d+\.\d+(:\d+)?|"
+    r"https://[a-zA-Z0-9_.-]+\.pages\.dev(:\d+)?|"
+    r"https://[a-zA-Z0-9-]+\.trycloudflare\.com(:\d+)?|"
     r"capacitor://localhost)$"
 )
 
@@ -296,8 +298,24 @@ def resolve_best_redirect_origin(request: Optional[Request] = None, candidate: O
     4. If request is provided and Host header is non-localhost, use request origin.
     5. Otherwise, detect the host machine's primary LAN IPv4 address (e.g. 192.168.x.x) and combine with :8080.
     """
-    # 1. Environment variables
-    for env_key in ("PUBLIC_SITE_URL", "PUBLIC_DOMAIN", "FRONTEND_ORIGIN", "APP_PUBLIC_URL", "VITE_PUBLIC_SITE_URL", "STREAM_PUBLIC_BASE_URL"):
+    # 1. Environment variables: prioritize explicit public domain / frontend origin
+    public_dom = (os.environ.get("PUBLIC_DOMAIN") or getattr(settings, "PUBLIC_DOMAIN", None) or "").strip().rstrip("/")
+    if public_dom and public_dom not in ("localhost", "127.0.0.1") and not public_dom.startswith("127."):
+        if not public_dom.startswith("http://") and not public_dom.startswith("https://"):
+            public_dom = f"https://{public_dom}"
+        return public_dom
+
+    frontend_orig = (os.environ.get("FRONTEND_ORIGIN") or getattr(settings, "FRONTEND_ORIGIN", None) or "").strip().rstrip("/")
+    if frontend_orig:
+        try:
+            parsed = urllib.parse.urlparse(frontend_orig)
+            h = parsed.hostname or ""
+            if h not in ("localhost", "127.0.0.1") and not h.startswith("127."):
+                return frontend_orig
+        except Exception:
+            pass
+
+    for env_key in ("PUBLIC_SITE_URL", "APP_PUBLIC_URL", "VITE_PUBLIC_SITE_URL", "STREAM_PUBLIC_BASE_URL"):
         val = (os.environ.get(env_key) or getattr(settings, env_key, None) or "").strip().rstrip("/")
         if val:
             if not val.startswith("http://") and not val.startswith("https://"):
@@ -325,7 +343,7 @@ def resolve_best_redirect_origin(request: Optional[Request] = None, candidate: O
                 if "trycloudflare.com" in cand_host:
                     if active_cf and cand_clean == active_cf:
                         return cand_clean
-                elif ALLOWED_ORIGIN_REGEX.match(cand_clean):
+                elif "pages.dev" in cand_host or ALLOWED_ORIGIN_REGEX.match(cand_clean):
                     return cand_clean
         except Exception:
             pass
@@ -351,6 +369,8 @@ def resolve_best_redirect_origin(request: Optional[Request] = None, candidate: O
             is_valid_origin = False
             if "trycloudflare.com" in host_name:
                 is_valid_origin = bool(active_cf and candidate_origin == active_cf)
+            elif "pages.dev" in host_name:
+                is_valid_origin = bool(ALLOWED_ORIGIN_REGEX.match(candidate_origin))
             else:
                 is_valid_origin = bool(
                     ALLOWED_ORIGIN_REGEX.match(candidate_origin)

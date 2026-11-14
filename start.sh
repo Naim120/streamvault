@@ -574,6 +574,8 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
       fi
 
       if command -v cloudflared >/dev/null 2>&1 || [ -f "$DIR/cloudflared" ]; then
+        # Truncate cloudflared log to prevent reading an old stale URL from a previous session
+        : > "$DIR/logs/cloudflared.log"
         if [ "$DAEMON_MODE" = "true" ]; then
           setsid nohup "$cf_bin" tunnel --url http://127.0.0.1:8080 < /dev/null >> "$DIR/logs/cloudflared.log" 2>&1 &
         else
@@ -583,8 +585,8 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
         echo "$TUNNEL_PID" > "$DIR/.nginx/cloudflared.pid"
       fi
 
-      # Wait up to 6 seconds for tunnel origin URL to appear in logs
-      for i in $(seq 1 6); do
+      # Wait up to 15 seconds for tunnel origin URL to appear in logs
+      for i in $(seq 1 15); do
         if [ -f "$DIR/logs/cloudflared.log" ]; then
           TUNNEL_URL="$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$DIR/logs/cloudflared.log" | tail -n1 || true)"
           [ -n "$TUNNEL_URL" ] && break
@@ -594,8 +596,69 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
 
       # If Cloudflare Pages project is configured, update backend tunnel origin
       if [ -n "$TUNNEL_URL" ]; then
-        if [ -f "$DIR/cloudflare-pages/_worker.js" ]; then
-          python3 -c "
+        mkdir -p "$DIR/cloudflare-pages"
+        if [ ! -f "$DIR/cloudflare-pages/_worker.js" ]; then
+          cat > "$DIR/cloudflare-pages/_worker.js" <<'WORKER_EOF'
+export default {
+  async fetch(request, env) {
+    const url = new URL(request.url);
+    const targetOrigin = (env.BACKEND_TUNNEL_URL || "__TUNNEL_ORIGIN_PLACEHOLDER__").replace(/\/$/, "");
+
+    const isBackendPath = url.pathname.startsWith("/api/") || 
+                          url.pathname.startsWith("/media/") || 
+                          url.pathname === "/sitemap.xml";
+
+    if (!isBackendPath && env.ASSETS) {
+      try {
+        const assetResponse = await env.ASSETS.fetch(request);
+        if (assetResponse.status !== 404) return assetResponse;
+        const spaResponse = await env.ASSETS.fetch(new Request(new URL("/", request.url), request));
+        if (spaResponse.ok) return spaResponse;
+      } catch (_) {}
+    }
+
+    if (!targetOrigin || targetOrigin.includes("PLACEHOLDER")) {
+      return new Response("Gateway Waiting for Tunnel...", { status: 503 });
+    }
+
+    const targetUrl = new URL(url.pathname + url.search, targetOrigin);
+    const proxyHeaders = new Headers(request.headers);
+    proxyHeaders.set("X-Forwarded-Host", url.host);
+    proxyHeaders.set("X-Forwarded-Proto", "https");
+    if (request.cf) {
+      if (request.cf.country) proxyHeaders.set("CF-IPCountry", request.cf.country);
+      if (request.cf.city) proxyHeaders.set("CF-IPCity", request.cf.city);
+    }
+
+    try {
+      const response = await fetch(new Request(targetUrl, {
+        method: request.method,
+        headers: proxyHeaders,
+        body: request.body,
+        redirect: "manual",
+      }));
+      const responseHeaders = new Headers(response.headers);
+      const locationHeader = responseHeaders.get("Location");
+      if (locationHeader) {
+        try {
+          const locUrl = new URL(locationHeader, targetOrigin);
+          responseHeaders.set("Location", new URL(locUrl.pathname + locUrl.search + locUrl.hash, url.origin).toString());
+        } catch (_) {}
+      }
+      return new Response(response.body, {
+        status: response.status,
+        statusText: response.statusText,
+        headers: responseHeaders,
+      });
+    } catch (err) {
+      return new Response("Server Offline", { status: 502 });
+    }
+  },
+};
+WORKER_EOF
+        fi
+
+        python3 -c "
 import sys, re
 path, url = sys.argv[1], sys.argv[2]
 try:
@@ -607,10 +670,11 @@ try:
 except Exception:
     pass
 " "$DIR/cloudflare-pages/_worker.js" "${TUNNEL_URL}"
-          if [ -d "$DIR/frontend/dist" ]; then
-            cp "$DIR/cloudflare-pages/_worker.js" "$DIR/frontend/dist/_worker.js" 2>/dev/null || true
-          fi
+
+        if [ -d "$DIR/frontend/dist" ]; then
+          cp "$DIR/cloudflare-pages/_worker.js" "$DIR/frontend/dist/_worker.js" 2>/dev/null || true
         fi
+
         if [ -n "${CLOUDFLARE_ACCOUNT_ID:-}" ] && [ -n "${CLOUDFLARE_API_TOKEN:-}" ] && [ -n "${CF_PAGES_PROJECT:-}" ]; then
           echo "Syncing active tunnel to Cloudflare Pages (${CF_PAGES_PROJECT})..."
           curl -s -X PATCH "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/pages/projects/${CF_PAGES_PROJECT}" \
@@ -619,11 +683,11 @@ except Exception:
             -d "{\"deployment_configs\":{\"production\":{\"env_vars\":{\"BACKEND_TUNNEL_URL\":{\"value\":\"${TUNNEL_URL}\"}}}}}" >/dev/null 2>&1 || true
 
           if [ -d "$DIR/frontend/dist" ] && command -v npx >/dev/null 2>&1; then
-            echo "Deploying updated gateway to Cloudflare Pages in background..."
+            echo "Deploying updated gateway to Cloudflare Pages (logging to logs/cf_pages_deploy.log)..."
             (
               CLOUDFLARE_ACCOUNT_ID="$CLOUDFLARE_ACCOUNT_ID" \
               CLOUDFLARE_API_TOKEN="$CLOUDFLARE_API_TOKEN" \
-              npx wrangler@3 pages deploy "$DIR/frontend/dist" --project-name="$CF_PAGES_PROJECT" --branch=main --commit-dirty=true >/dev/null 2>&1
+              npx --yes wrangler@3 pages deploy "$DIR/frontend/dist" --project-name="$CF_PAGES_PROJECT" --branch=main --commit-dirty=true > "$DIR/logs/cf_pages_deploy.log" 2>&1
             ) &
           fi
         fi
