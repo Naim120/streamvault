@@ -82,14 +82,20 @@ prepare_nginx_conf() {
 
   local nginx_template="$DIR/nginx.conf"
   local nginx_runtime="$DIR/.nginx/nginx.conf"
+  local api_port="${MEDIA_SERVER_PORT:-8000}"
 
   if [ -f "$nginx_template" ]; then
-    # Dynamically rewrite template directory paths to the current project directory ($DIR)
+    # Dynamically rewrite template directory paths and internal media server port ($DIR, $api_port)
     sed \
       -e "s|/var/www/streamvault|$DIR|g" \
       -e "s|/home/naim/netflix|$DIR|g" \
       -e "s|{{STREAMVAULT_DIR}}|$DIR|g" \
+      -e "s|http://127.0.0.1:[0-9]\+/|http://127.0.0.1:${api_port}/|g" \
       "$nginx_template" > "$nginx_runtime"
+  fi
+
+  if [ -f /etc/nginx/conf.d/streamvault.conf ]; then
+    $SUDO sed -i "s|http://127.0.0.1:[0-9]\+/|http://127.0.0.1:${api_port}/|g" /etc/nginx/conf.d/streamvault.conf 2>/dev/null || true
   fi
 }
 
@@ -125,13 +131,22 @@ show_status() {
   echo ""
   echo -e "${BOLD}Live Component Breakdown:${NC}"
 
-  # 1. FastAPI Media Server (:8000)
+  # 1. FastAPI Media Server
+  local api_port="${MEDIA_SERVER_PORT:-8000}"
   local api_pid
-  api_pid="$(lsof -ti :8000 2>/dev/null | head -n1 || pgrep -f "uvicorn app.main:app" | head -n1 || true)"
+  api_pid="$(pgrep -f "uvicorn app.main:app" | head -n1 || true)"
+  if [ -z "$api_pid" ]; then
+    api_pid="$(pgrep -f "streamvault-api" | head -n1 || true)"
+  fi
+  if [ -z "$api_pid" ] && (echo > /dev/tcp/127.0.0.1/"$api_port") 2>/dev/null; then
+    if curl -sI "http://127.0.0.1:${api_port}/" 2>/dev/null | grep -iq "StreamVault"; then
+      api_pid="Active (Port ${api_port})"
+    fi
+  fi
   if [ -n "$api_pid" ]; then
-    echo -e "  • FastAPI Media Server   [Port 8000] : ${GREEN}● RUNNING${NC} (PID: ${api_pid})"
+    echo -e "  • FastAPI Media Server   [Port ${api_port}] : ${GREEN}● RUNNING${NC} (PID: ${api_pid})"
   else
-    echo -e "  • FastAPI Media Server   [Port 8000] : ${RED}○ STOPPED${NC}"
+    echo -e "  • FastAPI Media Server   [Port ${api_port}] : ${RED}○ STOPPED${NC}"
   fi
 
   # 2. Local Admin Panel (:4000)
@@ -385,14 +400,38 @@ else
   echo "[1/4] aria2c daemon is already active."
 fi
 
-# 2. FastAPI Media Server (Port 8000)
-echo "[2/4] Starting FastAPI Media Server on port 8000..."
-cd "$DIR/backend"
+# 2. FastAPI Media Server
 API_HOST="127.0.0.1"
+API_PORT="${MEDIA_SERVER_PORT:-8000}"
+
+# Auto-detect if target API_PORT is occupied by an external foreign process
+if (echo > /dev/tcp/127.0.0.1/"$API_PORT") 2>/dev/null; then
+  if ! pgrep -f "uvicorn app.main:app" >/dev/null 2>&1; then
+    echo -e "${YELLOW}[ ! ] Port ${API_PORT} is in use by an external application. Auto-allocating StreamVault Media Server to port 8005.${NC}"
+    API_PORT="8005"
+    export MEDIA_SERVER_PORT="8005"
+    export MEDIA_SERVER_INTERNAL_URL="http://127.0.0.1:8005"
+    if [ -f "$DIR/.env" ]; then
+      if grep -q "^MEDIA_SERVER_PORT=" "$DIR/.env"; then
+        sed -i 's/^MEDIA_SERVER_PORT=.*/MEDIA_SERVER_PORT=8005/' "$DIR/.env"
+      else
+        echo "MEDIA_SERVER_PORT=8005" >> "$DIR/.env"
+      fi
+      if grep -q "^MEDIA_SERVER_INTERNAL_URL=" "$DIR/.env"; then
+        sed -i 's|^MEDIA_SERVER_INTERNAL_URL=.*|MEDIA_SERVER_INTERNAL_URL=http://127.0.0.1:8005|' "$DIR/.env"
+      else
+        echo "MEDIA_SERVER_INTERNAL_URL=http://127.0.0.1:8005" >> "$DIR/.env"
+      fi
+    fi
+  fi
+fi
+
+echo "[2/4] Starting FastAPI Media Server on port ${API_PORT}..."
+cd "$DIR/backend"
 if [ "$DAEMON_MODE" = "true" ]; then
-  setsid nohup "$UVICORN" app.main:app --host "$API_HOST" --port 8000 < /dev/null >> "$DIR/logs/media_server.log" 2>&1 &
+  setsid nohup "$UVICORN" app.main:app --host "$API_HOST" --port "$API_PORT" < /dev/null >> "$DIR/logs/media_server.log" 2>&1 &
 else
-  "$UVICORN" app.main:app --host "$API_HOST" --port 8000 >> "$DIR/logs/media_server.log" 2>&1 &
+  "$UVICORN" app.main:app --host "$API_HOST" --port "$API_PORT" >> "$DIR/logs/media_server.log" 2>&1 &
 fi
 MEDIA_PID=$!
 

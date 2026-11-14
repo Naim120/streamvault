@@ -7,6 +7,9 @@
 .env.*
 *.env
 !.env.example
+*.key
+*.pem
+Hermes.key
 
 # 2. Binaries & Executables
 cloudflared

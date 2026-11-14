@@ -173,6 +173,8 @@ async def require_admin_secret(
             "http://localhost:8080",
             "http://127.0.0.1:8000",
             "http://localhost:8000",
+            f"http://127.0.0.1:{settings.MEDIA_SERVER_PORT}",
+            f"http://localhost:{settings.MEDIA_SERVER_PORT}",
         }
         if origin_hdr not in allowed_admin_origins:
             raise HTTPException(status_code=403, detail="Forbidden: Cross-origin admin access blocked")

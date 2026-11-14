@@ -742,6 +742,14 @@ if [ "$RESUME_FROM_STEP" -le 5 ]; then
     STREAM_TOKEN_SECRET="$(openssl rand -hex 32)"
     ARIA2_RPC_SECRET="$(openssl rand -hex 16)"
 
+    API_PORT="8000"
+    if (echo > /dev/tcp/127.0.0.1/8000) 2>/dev/null; then
+      if ! pgrep -f "uvicorn app.main:app" >/dev/null 2>&1; then
+        warn "Port 8000 is occupied by an external application. Auto-allocating StreamVault Media Server to port 8005."
+        API_PORT="8005"
+      fi
+    fi
+
     ( umask 077 && touch "$ENV_FILE" && chmod 600 "$ENV_FILE" )
     cat > "$ENV_FILE" <<EOF
 # --- Frontend (Vite) ---
@@ -753,6 +761,8 @@ VITE_MEDIA_SERVER_URL=
 SUPABASE_URL=${SUPABASE_URL}
 SUPABASE_ANON_KEY=${SUPABASE_ANON_KEY}
 SUPABASE_SERVICE_ROLE_KEY=${SUPABASE_SERVICE_ROLE_KEY}
+MEDIA_SERVER_PORT=${API_PORT}
+MEDIA_SERVER_INTERNAL_URL=http://127.0.0.1:${API_PORT}
 
 # --- Metadata Providers ---
 TMDB_API_KEY=${TMDB_API_KEY}
@@ -784,10 +794,24 @@ EOF
     chmod 600 "$ENV_FILE"
     success "Created secured .env configuration."
   else
+    API_PORT="8000"
+    if [ -f "$ENV_FILE" ]; then
+      existing_port="$(grep '^MEDIA_SERVER_PORT=' "$ENV_FILE" | cut -d'=' -f2 | tr -d ' "' || true)"
+      [ -n "$existing_port" ] && API_PORT="$existing_port"
+    fi
+    if [ "$API_PORT" = "8000" ] && (echo > /dev/tcp/127.0.0.1/8000) 2>/dev/null; then
+      if ! pgrep -f "uvicorn app.main:app" >/dev/null 2>&1; then
+        warn "Port 8000 is occupied by an external application. Auto-allocating StreamVault Media Server to port 8005."
+        API_PORT="8005"
+      fi
+    fi
+
     ( umask 077 && touch "${ENV_FILE}.tmp" && chmod 600 "${ENV_FILE}.tmp" )
-    grep -vE '^(FRONTEND_ORIGIN|PUBLIC_DOMAIN|MEDIA_DIR|VITE_MEDIA_SERVER_URL|ENABLE_TUNNEL|TUNNEL_TYPE|CF_PAGES_PROJECT|CLOUDFLARE_ACCOUNT_ID|CLOUDFLARE_API_TOKEN|DEFAULT_ALLOCATED_CPU_CORES|DEFAULT_ALLOCATED_RAM_MB|DEFAULT_GPU_ENABLED|DEFAULT_TRANSCODING_ENABLED)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
+    grep -vE '^(FRONTEND_ORIGIN|PUBLIC_DOMAIN|MEDIA_DIR|VITE_MEDIA_SERVER_URL|ENABLE_TUNNEL|TUNNEL_TYPE|CF_PAGES_PROJECT|CLOUDFLARE_ACCOUNT_ID|CLOUDFLARE_API_TOKEN|DEFAULT_ALLOCATED_CPU_CORES|DEFAULT_ALLOCATED_RAM_MB|DEFAULT_GPU_ENABLED|DEFAULT_TRANSCODING_ENABLED|MEDIA_SERVER_PORT|MEDIA_SERVER_INTERNAL_URL)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
     cat >> "${ENV_FILE}.tmp" <<EOF
 VITE_MEDIA_SERVER_URL=
+MEDIA_SERVER_PORT=${API_PORT}
+MEDIA_SERVER_INTERNAL_URL=http://127.0.0.1:${API_PORT}
 FRONTEND_ORIGIN=${FRONTEND_ORIGIN}
 PUBLIC_DOMAIN=${PUBLIC_DOMAIN}
 MEDIA_DIR=${MEDIA_DIR}
@@ -880,6 +904,12 @@ if [ "$RESUME_FROM_STEP" -le 7 ]; then
   record_checkpoint 7
   echo -e "${BOLD}--- Step 7: Configuring Nginx Single-Origin Gateway (Port ${NGINX_PORT:-8080}) ---${NC}"
 
+  API_PORT="8000"
+  if [ -f "$ENV_FILE" ]; then
+    existing_port="$(grep '^MEDIA_SERVER_PORT=' "$ENV_FILE" | cut -d'=' -f2 | tr -d ' "' || true)"
+    [ -n "$existing_port" ] && API_PORT="$existing_port"
+  fi
+
   mkdir -p "${TARGET_DIR}/nginx"
   cat > "${TARGET_DIR}/nginx/streamvault.conf" <<EOF
 # Only trust CF-Connecting-IP when the TCP connection comes from local cloudflared (127.0.0.1/::1) AND includes a CF-Ray header
@@ -964,7 +994,7 @@ server {
 
     # 1. API & HLS Streaming Reverse Proxy
     location /api/ {
-        proxy_pass http://127.0.0.1:8000/api/;
+        proxy_pass http://127.0.0.1:${API_PORT}/api/;
         proxy_http_version 1.1;
 
         # Forward real client headers for security and rate limiting
@@ -986,7 +1016,7 @@ server {
 
     # 2. Direct Media Ingestion & Static Media Proxy
     location /media/ {
-        proxy_pass http://127.0.0.1:8000/media/;
+        proxy_pass http://127.0.0.1:${API_PORT}/media/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$trusted_client_real_ip;
@@ -1005,7 +1035,7 @@ server {
 
     # Dynamic XML Sitemap with static fallback
     location = /sitemap.xml {
-        proxy_pass http://127.0.0.1:8000/sitemap.xml;
+        proxy_pass http://127.0.0.1:${API_PORT}/sitemap.xml;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$trusted_client_real_ip;
@@ -1036,9 +1066,9 @@ server {
 }
 EOF
 
-  # Ensure standalone nginx.conf is also synchronized with the target installation directory
+  # Ensure standalone nginx.conf is also synchronized with the target installation directory and API port
   if [ -f "${TARGET_DIR}/nginx.conf" ]; then
-    sed -i "s|/var/www/streamvault|${TARGET_DIR}|g; s|/home/naim/netflix|${TARGET_DIR}|g" "${TARGET_DIR}/nginx.conf" 2>/dev/null || true
+    sed -i "s|/var/www/streamvault|${TARGET_DIR}|g; s|/home/naim/netflix|${TARGET_DIR}|g; s|http://127.0.0.1:[0-9]\+/|http://127.0.0.1:${API_PORT}/|g" "${TARGET_DIR}/nginx.conf" 2>/dev/null || true
   fi
 
   if [ -d /etc/nginx/conf.d ]; then
