@@ -595,7 +595,18 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
       # If Cloudflare Pages project is configured, update backend tunnel origin
       if [ -n "$TUNNEL_URL" ]; then
         if [ -f "$DIR/cloudflare-pages/_worker.js" ]; then
-          sed -i -E "s|targetOrigin = \(env\.BACKEND_TUNNEL_URL \|\| [^)]+\)|targetOrigin = (env.BACKEND_TUNNEL_URL \|\| \"${TUNNEL_URL}\")|g" "$DIR/cloudflare-pages/_worker.js" 2>/dev/null || true
+          python3 -c "
+import sys, re
+path, url = sys.argv[1], sys.argv[2]
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        c = f.read()
+    c = re.sub(r'targetOrigin = \(env\.BACKEND_TUNNEL_URL \|\| [^)]+\)', f'targetOrigin = (env.BACKEND_TUNNEL_URL || \"{url}\")', c)
+    with open(path, 'w', encoding='utf-8') as f:
+        f.write(c)
+except Exception:
+    pass
+" "$DIR/cloudflare-pages/_worker.js" "${TUNNEL_URL}"
           if [ -d "$DIR/frontend/dist" ]; then
             cp "$DIR/cloudflare-pages/_worker.js" "$DIR/frontend/dist/_worker.js" 2>/dev/null || true
           fi
