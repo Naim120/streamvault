@@ -3,10 +3,12 @@ import os
 import sys
 import logging
 import urllib.parse
+import hmac
+import hashlib
 from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException, Response
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
@@ -31,7 +33,7 @@ logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 from backend.app.config import settings
 from backend.app.utils.process_identity import set_process_identity
-from modules.common import STATIC_DIR
+from modules.common import STATIC_DIR, ADMIN_SECRET
 from modules import dashboard, download_manager, media, metadata, user_telemetry
 
 # Set production OS process identity
@@ -40,6 +42,22 @@ set_process_identity("streamvault-admin")
 if not settings.SUPABASE_URL or not (settings.SUPABASE_SERVICE_ROLE_KEY or settings.SUPABASE_ANON_KEY):
     raise RuntimeError("CRITICAL: Supabase credentials are missing in Admin Server environment!")
 logging.getLogger("admin-server").info("✓ Supabase credentials loaded & verified")
+
+def _get_admin_session_token() -> str:
+    key = (ADMIN_SECRET or "streamvault_admin_default_salt").encode("utf-8")
+    return hmac.new(key, b"streamvault_admin_session_v1", hashlib.sha256).hexdigest()
+
+def is_admin_authenticated(request: Request) -> bool:
+    if not ADMIN_SECRET:
+        return True
+    x_sec = request.headers.get("x-admin-secret", "").strip()
+    if x_sec and hmac.compare_digest(x_sec.encode("utf-8"), ADMIN_SECRET.encode("utf-8")):
+        return True
+    sess = request.cookies.get("streamvault_admin_session", "").strip()
+    expected = _get_admin_session_token()
+    if sess and hmac.compare_digest(sess.encode("utf-8"), expected.encode("utf-8")):
+        return True
+    return False
 
 app = FastAPI(title="StreamVault Decoupled Local Admin Panel")
 
@@ -58,9 +76,29 @@ class StreamVaultAdminBrandingMiddleware(BaseHTTPMiddleware):
             return Response(status_code=403, content="Forbidden: Invalid Host header for Local Admin Panel")
 
         sec_fetch_site = request.headers.get("sec-fetch-site", "").lower()
+        sec_fetch_mode = request.headers.get("sec-fetch-mode", "").lower()
         origin = request.headers.get("origin", "").rstrip("/")
-        if sec_fetch_site == "cross-site" or (origin and origin not in ("http://127.0.0.1:4000", "http://localhost:4000")):
-            return Response(status_code=403, content="Forbidden: Cross-origin request to Local Admin Panel blocked")
+
+        # Allow top-level GET navigation (e.g. following links or typing URL in browser)
+        is_top_level_nav = (request.method in ("GET", "HEAD") and sec_fetch_mode == "navigate")
+
+        if not is_top_level_nav:
+            if sec_fetch_site == "cross-site" or (origin and origin not in ("http://127.0.0.1:4000", "http://localhost:4000")):
+                return Response(status_code=403, content="Forbidden: Cross-origin request to Local Admin Panel blocked")
+        elif origin and origin not in ("http://127.0.0.1:4000", "http://localhost:4000"):
+            if request.method not in ("GET", "HEAD"):
+                return Response(status_code=403, content="Forbidden: Cross-origin request to Local Admin Panel blocked")
+
+        # Inbound administrative authentication guard for /api/* routes
+        path = request.url.path
+        if path.startswith("/api/"):
+            if path not in ("/api/admin/auth/login", "/api/admin/auth/logout"):
+                if not is_admin_authenticated(request):
+                    return Response(
+                        status_code=401,
+                        content=json.dumps({"detail": "Unauthorized: Admin authentication required"}),
+                        media_type="application/json"
+                    )
 
         response = await call_next(request)
         response.headers["Server"] = "StreamVault-Media-Engine/2.5"
@@ -79,29 +117,64 @@ class StreamVaultAdminBrandingMiddleware(BaseHTTPMiddleware):
         )
         return response
 
-# Request Body Size Limit Middleware (15MB for torrents/uploads, 64KB for JSON)
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method in ("POST", "PUT", "PATCH"):
-            cl_header = request.headers.get("content-length")
-            if cl_header:
+class _PayloadTooLargeError(Exception):
+    pass
+
+# Pure ASGI Request Body Size Limit Middleware (15MB for torrents/uploads, 64KB for JSON)
+class RequestSizeLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            path = scope.get("path", "")
+            is_upload = "/add" in path or "/torrent" in path or "/upload" in path or "/subtitles" in path
+            max_bytes = (15 * 1024 * 1024) if is_upload else (64 * 1024)
+            headers = dict(scope.get("headers", []))
+            cl = headers.get(b"content-length")
+            if cl:
                 try:
-                    cl_bytes = int(cl_header)
+                    cl_bytes = int(cl)
                 except ValueError:
-                    cl_bytes = 0
-
-                path = request.url.path
-                is_upload_route = "/add" in path or "/torrent" in path or "/upload" in path or "/subtitles" in path
-                max_bytes = (15 * 1024 * 1024) if is_upload_route else (64 * 1024)
-
+                    resp = Response(status_code=400, content=json.dumps({"detail": "Invalid Content-Length"}), media_type="application/json")
+                    await resp(scope, receive, send)
+                    return
+                if cl_bytes < 0:
+                    resp = Response(status_code=400, content=json.dumps({"detail": "Invalid Content-Length"}), media_type="application/json")
+                    await resp(scope, receive, send)
+                    return
                 if cl_bytes > max_bytes:
-                    return Response(
-                        status_code=413,
-                        content=json.dumps({"detail": f"Payload Too Large: Content-Length exceeds maximum limit ({max_bytes} bytes)"}),
-                        media_type="application/json"
-                    )
-
-        return await call_next(request)
+                    resp = Response(status_code=413, content=json.dumps({"detail": f"Payload Too Large (max {max_bytes} bytes)"}), media_type="application/json")
+                    await resp(scope, receive, send)
+                    return
+            total = 0
+            exceeded = False
+            response_started = False
+            async def limited_receive():
+                nonlocal total, exceeded
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    total += len(msg.get("body", b""))
+                    if total > max_bytes:
+                        exceeded = True
+                        raise _PayloadTooLargeError()
+                return msg
+            async def tracked_send(message):
+                nonlocal response_started
+                if exceeded and message["type"] in ("http.response.start", "http.response.body"):
+                    return
+                if message["type"] == "http.response.start":
+                    response_started = True
+                await send(message)
+            try:
+                await self.app(scope, limited_receive, tracked_send)
+            except* _PayloadTooLargeError:
+                pass
+            if exceeded and not response_started:
+                resp = Response(status_code=413, content=json.dumps({"detail": f"Payload Too Large (max {max_bytes} bytes)"}), media_type="application/json")
+                await resp(scope, receive, send)
+            return
+        await self.app(scope, receive, send)
 
 app.add_middleware(RequestSizeLimitMiddleware)
 app.add_middleware(StreamVaultAdminBrandingMiddleware)
@@ -228,6 +301,10 @@ HTML_SHELL_TOP = r"""<!DOCTYPE html>
         <div id="top-encoder" class="bg-purple-500/10 border border-purple-500/30 px-2.5 py-1 rounded-lg text-purple-400 font-mono font-bold uppercase text-[10px]">
           Detecting...
         </div>
+        <button onclick="handleAdminLogout()" title="Sign Out of Admin Session" class="px-2.5 py-1 bg-neutral-800 hover:bg-red-600/30 text-neutral-400 hover:text-red-300 border border-neutral-700 rounded-lg text-xs font-semibold transition cursor-pointer flex items-center gap-1.5 shadow">
+          <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M17 16l4-4m0 0l-4-4m4 4H7m6 4v1a3 3 0 01-3 3H6a3 3 0 01-3-3V7a3 3 0 013-3h4a3 3 0 013 3v1"></path></svg>
+          <span class="hidden sm:inline">Sign Out</span>
+        </button>
       </div>
     </header>
 
@@ -280,6 +357,13 @@ GLOBAL_SHELL_JS = r"""    function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+    }
+
+    async function handleAdminLogout() {
+      try {
+        await fetch('/api/admin/auth/logout', { method: 'POST' });
+      } catch (e) {}
+      window.location.reload();
     }
 
     function updateModalOpenClass() {
@@ -549,9 +633,108 @@ HTML_CONTENT = "\n".join([
     HTML_SHELL_BOTTOM
 ])
 
+HTML_LOGIN_SHELL = r"""<!DOCTYPE html>
+<html lang="en" class="dark">
+<head>
+  <meta charset="UTF-8">
+  <title>StreamVault Admin Authentication (127.0.0.1:4000)</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <link rel="stylesheet" href="/static/tailwind.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+  <style>
+    body { font-family: 'Inter', sans-serif; background-color: #0c0c0c; color: #fff; }
+    .mono { font-family: 'JetBrains Mono', monospace; }
+  </style>
+</head>
+<body class="h-screen w-screen flex items-center justify-center bg-[#0c0c0c] p-4 text-white">
+  <div class="bg-[#141414] border border-neutral-800 rounded-3xl p-8 max-w-md w-full space-y-6 shadow-2xl relative">
+    <div class="flex items-center gap-3">
+      <span class="px-2.5 py-0.5 bg-red-600 text-white font-mono font-black text-xs rounded tracking-wider">ADMIN</span>
+      <h1 class="text-xl font-black text-white tracking-wide">StreamVault</h1>
+    </div>
+    <div class="space-y-1">
+      <h2 class="text-base font-bold text-neutral-200">Local Operations Authentication</h2>
+      <p class="text-xs text-neutral-400 leading-relaxed">Enter your configured <code class="mono text-red-400">ADMIN_API_SECRET</code> to unlock the local operations dashboard.</p>
+    </div>
+    <form id="admin-login-form" onsubmit="handleAdminLogin(event)" class="space-y-4">
+      <div class="space-y-1.5">
+        <label for="admin-secret" class="text-xs font-semibold text-neutral-400">Admin Secret</label>
+        <input type="password" id="admin-secret" required autofocus placeholder="Paste ADMIN_API_SECRET..." class="w-full bg-[#1e1e1e] border border-neutral-700 rounded-xl px-4 py-2.5 text-sm text-white focus:outline-none focus:border-red-500 font-mono transition">
+      </div>
+      <div id="login-error" class="hidden text-xs text-red-400 bg-red-950/40 border border-red-800/60 rounded-xl p-3 font-semibold"></div>
+      <button type="submit" id="login-btn" class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2.5 rounded-xl text-sm transition cursor-pointer shadow-lg shadow-red-600/20">
+        Unlock Dashboard
+      </button>
+    </form>
+  </div>
+  <script>
+    async function handleAdminLogin(e) {
+      e.preventDefault();
+      const secret = document.getElementById('admin-secret').value.trim();
+      const errEl = document.getElementById('login-error');
+      const btn = document.getElementById('login-btn');
+      errEl.classList.add('hidden');
+      btn.disabled = true;
+      btn.innerText = 'Verifying...';
+      try {
+        const res = await fetch('/api/admin/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ secret })
+        });
+        if (res.ok) {
+          window.location.reload();
+        } else {
+          const data = await res.json().catch(() => ({}));
+          errEl.innerText = data.detail || 'Invalid admin secret. Check your .env file.';
+          errEl.classList.remove('hidden');
+          btn.disabled = false;
+          btn.innerText = 'Unlock Dashboard';
+        }
+      } catch (err) {
+        errEl.innerText = 'Connection error. Ensure Admin server is running.';
+        errEl.classList.remove('hidden');
+        btn.disabled = false;
+        btn.innerText = 'Unlock Dashboard';
+      }
+    }
+  </script>
+</body>
+</html>
+"""
+
+@app.post("/api/admin/auth/login")
+async def admin_auth_login(request: Request):
+    try:
+        data = await request.json()
+        secret = (data.get("secret") or "").strip()
+    except Exception:
+        secret = ""
+
+    if not ADMIN_SECRET or hmac.compare_digest(secret.encode("utf-8"), ADMIN_SECRET.encode("utf-8")):
+        resp = JSONResponse(content={"status": "ok", "message": "Authenticated"})
+        resp.set_cookie(
+            "streamvault_admin_session",
+            _get_admin_session_token(),
+            httponly=True,
+            samesite="lax",
+            path="/"
+        )
+        return resp
+    raise HTTPException(status_code=401, detail="Invalid admin secret")
+
+@app.post("/api/admin/auth/logout")
+async def admin_auth_logout():
+    resp = JSONResponse(content={"status": "ok", "message": "Logged out"})
+    resp.delete_cookie("streamvault_admin_session", path="/")
+    return resp
+
 @app.get("/", response_class=HTMLResponse)
-async def admin_root():
-    return HTML_CONTENT
+async def admin_root(request: Request):
+    if not is_admin_authenticated(request):
+        return HTMLResponse(content=HTML_LOGIN_SHELL, status_code=200)
+    return HTMLResponse(content=HTML_CONTENT, status_code=200)
 
 if __name__ == "__main__":
     import uvicorn

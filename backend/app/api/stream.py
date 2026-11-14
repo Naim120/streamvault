@@ -38,8 +38,33 @@ async def check_media_published(target_id: str) -> bool:
     Verifies that the target movie, episode, or series is published (is_published == True).
     If an episode is targeted, verifies both the episode and its parent series are published.
     Returns False if hidden or not found.
+    Uses in-memory catalog cache for sub-millisecond zero-network lookup.
     """
     try:
+        from .metadata import get_cached_catalog_data
+        media_items, episodes, _ = await get_cached_catalog_data()
+        if media_items or episodes:
+            target_str = str(target_id).strip().lower()
+            # 1. Check media_items (Movie or Series)
+            for m in media_items:
+                if str(m.get("id", "")).strip().lower() == target_str:
+                    return bool(m.get("is_published", False))
+
+            # 2. Check episodes
+            for ep in episodes:
+                if str(ep.get("id", "")).strip().lower() == target_str:
+                    if not ep.get("is_published", False):
+                        return False
+                    parent_id = str(ep.get("media_id", "")).strip().lower()
+                    if parent_id:
+                        for p in media_items:
+                            if str(p.get("id", "")).strip().lower() == parent_id:
+                                return bool(p.get("is_published", False))
+                        return False
+                    return False
+            return False
+
+        # Fallback to Supabase if catalog cache is unpopulated
         # 1. Check media_items (Movie or Series)
         m = await db.select("media_items", {"id": f"eq.{target_id}", "limit": "1"})
         if m and len(m) > 0:
@@ -55,12 +80,13 @@ async def check_media_published(target_id: str) -> bool:
                 p = await db.select("media_items", {"id": f"eq.{parent_id}", "limit": "1"})
                 if p and len(p) > 0:
                     return bool(p[0].get("is_published", False))
-            return True
+                return False
+            return False
     except Exception as e:
         logger.warning(f"Error checking publication status for {target_id}: {e}")
-        return True
+        return False
 
-    return True
+    return False
 
 
 async def resolve_stream_target(target_id: str, user_id: Optional[str] = None) -> tuple[str, Path]:
@@ -79,9 +105,12 @@ async def resolve_stream_target(target_id: str, user_id: Optional[str] = None) -
     cache_key = f"{target_id}:{user_id or 'anon'}"
     if cache_key in _SERIES_EPISODE_CACHE:
         cached_id = _SERIES_EPISODE_CACHE[cache_key]
-        cached_dir = Path(settings.MEDIA_LIBRARY_DIR) / cached_id
-        if (cached_dir / "master.m3u8").exists():
-            return cached_id, cached_dir
+        if await check_media_published(cached_id):
+            cached_dir = Path(settings.MEDIA_LIBRARY_DIR) / cached_id
+            if (cached_dir / "master.m3u8").exists():
+                return cached_id, cached_dir
+        else:
+            _SERIES_EPISODE_CACHE.pop(cache_key, None)
 
     # 1. Check user watch progress for active or next episode
     if user_id and user_id != "anonymous":
@@ -99,15 +128,15 @@ async def resolve_stream_target(target_id: str, user_id: Optional[str] = None) -
             if prog and len(prog) > 0 and prog[0].get("episode_id"):
                 row = prog[0]
                 res_ep_id = row["episode_id"]
-                pos = float(row.get("position_seconds") or 0.0)
-                dur = float(row.get("duration_seconds") or 0.0)
-                is_completed = bool(row.get("is_completed", False)) or (dur > 0 and (pos >= dur - 30 or pos / dur >= 0.95))
+                ep_chk = await db.select("episodes", {"id": f"eq.{res_ep_id}", "media_id": f"eq.{target_id}", "is_published": "eq.true", "limit": "1"})
+                if ep_chk:
+                    pos = float(row.get("position_seconds") or 0.0)
+                    dur = float(row.get("duration_seconds") or 0.0)
+                    is_completed = bool(row.get("is_completed", False)) or (dur > 0 and (pos >= dur - 30 or pos / dur >= 0.95))
 
-                if is_completed:
-                    # Episode was completed -> find next sequential published episode
-                    curr_ep_rows = await db.select("episodes", {"id": f"eq.{res_ep_id}", "limit": "1"})
-                    if curr_ep_rows:
-                        curr_ep = curr_ep_rows[0]
+                    if is_completed:
+                        # Episode was completed -> find next sequential published episode
+                        curr_ep = ep_chk[0]
                         curr_s = curr_ep.get("season_number", 1)
                         curr_e = curr_ep.get("episode_number", 1)
                         all_eps = await db.select(
@@ -130,11 +159,11 @@ async def resolve_stream_target(target_id: str, user_id: Optional[str] = None) -
                                     return next_ep_id, next_dir
                                 break
 
-                res_dir = Path(settings.MEDIA_LIBRARY_DIR) / res_ep_id
-                if (res_dir / "master.m3u8").exists():
-                    _SERIES_EPISODE_CACHE[cache_key] = res_ep_id
-                    logger.info(f"Resolved series {target_id} to user resume episode {res_ep_id}")
-                    return res_ep_id, res_dir
+                    res_dir = Path(settings.MEDIA_LIBRARY_DIR) / res_ep_id
+                    if (res_dir / "master.m3u8").exists():
+                        _SERIES_EPISODE_CACHE[cache_key] = res_ep_id
+                        logger.info(f"Resolved series {target_id} to user resume episode {res_ep_id}")
+                        return res_ep_id, res_dir
         except Exception as e:
             logger.warning(f"Error checking watch progress for series resolution: {e}")
 
@@ -162,11 +191,13 @@ async def resolve_stream_target(target_id: str, user_id: Optional[str] = None) -
 
     return target_id, library_dir
 
+_PLAYLIST_DURATION_CACHE: dict[str, tuple[float, float]] = {}
+
 def get_hls_playlist_duration(target_dir: Path) -> float:
     """
     Fast helper that reads video/playlist.m3u8 (or playlist.m3u8) in target_dir
-    and sums all #EXTINF:<seconds>, tags.
-    Takes <0.2ms from disk/OS buffer cache.
+    and sums all #EXTINF:<seconds>, tags with mtime-based in-memory caching.
+    Takes <0.005ms when cached.
     """
     try:
         cand_paths = [
@@ -185,6 +216,14 @@ def get_hls_playlist_duration(target_dir: Path) -> float:
             else:
                 return 0.0
 
+        p_str = str(playlist_path)
+        stat = playlist_path.stat()
+        mtime = stat.st_mtime
+        if p_str in _PLAYLIST_DURATION_CACHE:
+            cached_mtime, cached_dur = _PLAYLIST_DURATION_CACHE[p_str]
+            if cached_mtime == mtime:
+                return cached_dur
+
         total_sec = 0.0
         with open(playlist_path, "r", encoding="utf-8", errors="ignore") as f:
             for line in f:
@@ -194,6 +233,7 @@ def get_hls_playlist_duration(target_dir: Path) -> float:
                         total_sec += float(val)
                     except ValueError:
                         pass
+        _PLAYLIST_DURATION_CACHE[p_str] = (mtime, total_sec)
         return total_sec
     except Exception as e:
         logger.debug(f"Error calculating playlist duration for {target_dir}: {e}")
@@ -215,16 +255,16 @@ async def get_stream_access_token(
     if not is_pub:
         raise HTTPException(status_code=404, detail="Media not found or unavailable")
 
+    # Enforce cryptographic identity: user_id is strictly derived from verified JWT
     if authenticated_user_id:
         uid = authenticated_user_id
-    elif user_id and user_id != "anonymous":
-        uid = user_id
     else:
         uid = "anonymous"
 
     resolved_id = media_id
     resolved_episode = None
     resume_position_seconds = 0.0
+    saved_preferences = None
     media_item = None
 
     # Determine if media_id is a media_item (series/movie) or an episode
@@ -260,7 +300,7 @@ async def get_stream_access_token(
 
             last_ep = None
             if last_ep_id:
-                last_ep_rows = await db.select("episodes", {"id": f"eq.{last_ep_id}", "limit": "1"})
+                last_ep_rows = await db.select("episodes", {"id": f"eq.{last_ep_id}", "media_id": f"eq.{media_id}", "is_published": "eq.true", "limit": "1"})
                 if last_ep_rows:
                     last_ep = last_ep_rows[0]
 
@@ -294,6 +334,16 @@ async def get_stream_access_token(
             elif last_ep:
                 resolved_episode = last_ep
                 resolved_id = last_ep["id"]
+                if not is_comp and resume_position_seconds > 5.0 and prog and len(prog) > 0:
+                    row = prog[0]
+                    saved_preferences = {
+                        "audio_index": row.get("preferred_audio_index"),
+                        "audio_lang": row.get("preferred_audio_lang"),
+                        "audio_label": row.get("preferred_audio_label"),
+                        "subtitle_index": row.get("preferred_subtitle_index"),
+                        "subtitle_lang": row.get("preferred_subtitle_lang"),
+                        "subtitle_label": row.get("preferred_subtitle_label"),
+                    }
             else:
                 # No prior progress: fallback to first published episode (S1:E1)
                 first_eps = await db.select(
@@ -330,10 +380,21 @@ async def get_stream_access_token(
                     is_comp = bool(row.get("is_completed", False)) or (dur > 0 and (pos >= dur - 30 or pos / dur >= 0.95))
                     if not is_comp and pos > 5.0:
                         resume_position_seconds = pos
+                        saved_preferences = {
+                            "audio_index": row.get("preferred_audio_index"),
+                            "audio_lang": row.get("preferred_audio_lang"),
+                            "audio_label": row.get("preferred_audio_label"),
+                            "subtitle_index": row.get("preferred_subtitle_index"),
+                            "subtitle_lang": row.get("preferred_subtitle_lang"),
+                            "subtitle_label": row.get("preferred_subtitle_label"),
+                        }
     else:
         # Check if media_id is an Episode UUID directly
-        ep_rows = await db.select("episodes", {"id": f"eq.{media_id}", "limit": "1"})
+        ep_rows = await db.select("episodes", {"id": f"eq.{media_id}", "is_published": "eq.true", "limit": "1"})
         if ep_rows and len(ep_rows) > 0:
+            parent_id = ep_rows[0].get("media_id")
+            if parent_id and not await check_media_published(parent_id):
+                raise HTTPException(status_code=404, detail="Media not found or unavailable")
             resolved_episode = ep_rows[0]
             resolved_id = media_id
             if uid and uid != "anonymous":
@@ -352,6 +413,14 @@ async def get_stream_access_token(
                     is_comp = bool(row.get("is_completed", False)) or (dur > 0 and (pos >= dur - 30 or pos / dur >= 0.95))
                     if not is_comp and pos > 5.0:
                         resume_position_seconds = pos
+                        saved_preferences = {
+                            "audio_index": row.get("preferred_audio_index"),
+                            "audio_lang": row.get("preferred_audio_lang"),
+                            "audio_label": row.get("preferred_audio_label"),
+                            "subtitle_index": row.get("preferred_subtitle_index"),
+                            "subtitle_lang": row.get("preferred_subtitle_lang"),
+                            "subtitle_label": row.get("preferred_subtitle_label"),
+                        }
 
     library_dir = Path(settings.MEDIA_LIBRARY_DIR) / resolved_id
     token, expires = generate_stream_token(media_id=resolved_id, user_id=uid)
@@ -389,6 +458,7 @@ async def get_stream_access_token(
         "user_id": uid,
         "duration_seconds": round(duration_sec, 1) if duration_sec > 0 else 0,
         "resume_position_seconds": round(resume_position_seconds, 1) if resume_position_seconds > 0 else 0.0,
+        "saved_preferences": saved_preferences,
         "resolved_episode": resolved_episode,
         "audio_tracks": audio_tracks,
         "subtitle_tracks": subtitle_tracks,
@@ -418,6 +488,8 @@ async def get_master_playlist(
         raise HTTPException(status_code=404, detail="Media not found or unavailable")
 
     resolved_id, library_dir = await resolve_stream_target(valid_uuid, user_id=uid)
+    if resolved_id != valid_uuid and not await check_media_published(resolved_id):
+        raise HTTPException(status_code=404, detail="Media not found or unavailable")
 
     if not verify_stream_token(media_id=target_id, token=token, expires=expires, user_id=uid, alt_media_id=resolved_id):
         raise HTTPException(status_code=403, detail="Invalid or expired streaming token")
@@ -501,7 +573,19 @@ async def get_stream_chunk(
     if ext not in ALLOWED_STREAM_EXTENSIONS:
         raise HTTPException(status_code=403, detail="Access denied: Invalid streaming file extension")
 
-    resolved_id, library_dir = await resolve_stream_target(valid_uuid, user_id=uid)
+    is_pub = await check_media_published(valid_uuid)
+    if not is_pub:
+        raise HTTPException(status_code=404, detail="Media not found or unavailable")
+
+    # Fast-path .ts segment resolution: skip DB/watch_progress lookups if target directory exists directly
+    library_cand = Path(settings.MEDIA_LIBRARY_DIR) / valid_uuid
+    if ext == ".ts" and library_cand.is_dir():
+        resolved_id = valid_uuid
+        library_dir = library_cand
+    else:
+        resolved_id, library_dir = await resolve_stream_target(valid_uuid, user_id=uid)
+    if resolved_id != valid_uuid and not await check_media_published(resolved_id):
+        raise HTTPException(status_code=404, detail="Media not found or unavailable")
 
     # Segment Authentication vs Strict Manifest/Subtitle Token Verification
     if ext == ".ts":
@@ -590,13 +674,13 @@ async def get_stream_chunk(
     # Static segment caching headers (Cloudflare Edge Caching + Browser)
     if ext == ".ts":
         cache_headers = {
-            "Cache-Control": "public, max-age=21600, s-maxage=604800, immutable",
+            "Cache-Control": "private, no-transform, max-age=21600",
             "Accept-Ranges": "bytes",
             "Access-Control-Allow-Origin": "*"
         }
     else:
         cache_headers = {
-            "Cache-Control": "public, max-age=31536000, immutable",
+            "Cache-Control": "private, no-transform, max-age=14400",
             "Accept-Ranges": "bytes",
             "Access-Control-Allow-Origin": "*"
         }

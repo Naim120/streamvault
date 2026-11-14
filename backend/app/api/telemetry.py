@@ -8,8 +8,9 @@ import uuid
 import httpx
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel, Field
+from ..config import settings
 from ..database import db
-from ..security import require_authenticated_user, extract_trusted_client_ip
+from ..security import require_authenticated_user, extract_trusted_client_ip, revoke_user_tokens
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/telemetry", tags=["Telemetry"])
@@ -130,14 +131,16 @@ async def resolve_country_and_city(
         return IP_GEO_CACHE[ip]
 
     try:
-        async with httpx.AsyncClient(timeout=3.0) as client:
-            res = await client.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country,city")
-            if res.status_code == 200:
-                data = res.json()
-                country = data.get("country") or data.get("countryCode") or "Unknown"
-                city = data.get("city") or "Unknown"
-                IP_GEO_CACHE[ip] = (country, city)
-                return country, city
+        client = db.get_http_client()
+        res = await client.get(f"http://ip-api.com/json/{ip}?fields=countryCode,country,city")
+        if res.status_code == 200:
+            data = res.json()
+            country = data.get("country") or data.get("countryCode") or "Unknown"
+            city = data.get("city") or "Unknown"
+            if len(IP_GEO_CACHE) >= 4096:
+                IP_GEO_CACHE.pop(next(iter(IP_GEO_CACHE)), None)
+            IP_GEO_CACHE[ip] = (country, city)
+            return country, city
     except Exception:
         pass
 
@@ -242,7 +245,8 @@ async def record_session_start(
     primary_ip = ipv4 or ipv6 or "127.0.0.1"
 
     # 2. Determine Country & City
-    country, city = await resolve_country_and_city(primary_ip, cf_ipcountry, cf_ipcity)
+    trusted_ip = extract_trusted_client_ip(request)
+    country, city = await resolve_country_and_city(trusted_ip, cf_ipcountry, cf_ipcity)
 
     # 3. Parse User-Agent
     device_detected, os_name, browser = parse_user_agent(user_agent or "")
@@ -261,10 +265,26 @@ async def record_session_start(
     # 5. Ensure profile exists in public.profiles to satisfy fk_user_login_logs_profiles
     existing_prof = await db.select("profiles", {"id": f"eq.{user_id}"})
     if not existing_prof:
+        auth_email = None
+        if settings.SUPABASE_SERVICE_ROLE_KEY:
+            try:
+                resp = await db.get_http_client().get(
+                    f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}",
+                    headers={
+                        "apikey": settings.SUPABASE_SERVICE_ROLE_KEY,
+                        "Authorization": f"Bearer {settings.SUPABASE_SERVICE_ROLE_KEY}",
+                    },
+                )
+                if resp.status_code == 200:
+                    auth_email = (resp.json().get("email") or "").strip().lower() or None
+            except Exception as e:
+                logger.warning(f"Error fetching auth email for user {user_id}: {e}")
+        if not auth_email:
+            raise HTTPException(status_code=404, detail="Authenticated user email not found")
         profile_data = {
             "id": user_id,
-            "email": payload.email,
-            "display_name": (payload.email.split("@")[0] if payload.email else "User"),
+            "email": auth_email,
+            "display_name": auth_email.split("@")[0],
             "last_login_at": "now()",
             "last_seen_at": "now()",
             "is_signed_out": False,
@@ -318,8 +338,6 @@ async def record_session_start(
         "last_browser": browser,
         "current_activity": "Online — Browsing"
     }
-    if payload.email:
-        profile_update["email"] = payload.email
 
     await db.update("profiles", "id", user_id, profile_update)
 
@@ -439,12 +457,18 @@ async def record_heartbeat(
 @router.post("/logout")
 async def record_logout(
     payload: LogoutPayload,
+    request: Request,
     user_id: str = Depends(require_authenticated_user)
 ):
     """
     Authenticated session signout / tab close hook.
     Flushes any buffered heartbeat deltas, marks user as offline, and records logout timestamp.
     """
+    # Invalidate cached JWT token and record revocation timestamp for user
+    auth_header = request.headers.get("authorization", "")
+    token = auth_header.replace("Bearer ", "").strip() if auth_header.startswith("Bearer ") else None
+    revoke_user_tokens(user_id, token)
+
     # 1. Flush any pending buffered heartbeat deltas before logging out
     entry = None
     async with _buffer_lock:

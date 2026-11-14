@@ -200,6 +200,12 @@ CREATE TABLE IF NOT EXISTS public.watch_progress (
   duration_seconds DOUBLE PRECISION NOT NULL DEFAULT 0.0,
   is_completed BOOLEAN NOT NULL DEFAULT FALSE,
   updated_at TIMESTAMPTZ NOT NULL DEFAULT timezone('utc'::text, now()),
+  preferred_audio_index INTEGER DEFAULT NULL,
+  preferred_audio_lang TEXT DEFAULT NULL,
+  preferred_audio_label TEXT DEFAULT NULL,
+  preferred_subtitle_index INTEGER DEFAULT NULL,
+  preferred_subtitle_lang TEXT DEFAULT NULL,
+  preferred_subtitle_label TEXT DEFAULT NULL,
   CONSTRAINT uq_watch_progress_user_episode UNIQUE (user_id, episode_id)
 );
 
@@ -321,9 +327,10 @@ GRANT ALL ON TABLE public.user_likes TO service_role;
 GRANT ALL ON TABLE public.custom_lists TO service_role;
 GRANT ALL ON TABLE public.custom_list_items TO service_role;
 
--- Grants to authenticated users
-GRANT SELECT, UPDATE ON TABLE public.profiles TO authenticated;
-GRANT SELECT, INSERT ON TABLE public.user_login_logs TO authenticated;
+-- Grants to authenticated users (Restricted column update on profiles, no direct insert on login audit logs)
+GRANT SELECT ON TABLE public.profiles TO authenticated;
+GRANT UPDATE (display_name, avatar_url) ON TABLE public.profiles TO authenticated;
+GRANT SELECT ON TABLE public.user_login_logs TO authenticated;
 GRANT SELECT ON TABLE public.media_items TO authenticated;
 GRANT SELECT ON TABLE public.seasons TO authenticated;
 GRANT SELECT ON TABLE public.episodes TO authenticated;
@@ -351,7 +358,35 @@ CREATE POLICY "profiles_update_own"
   USING (auth.uid() = id)
   WITH CHECK (auth.uid() = id);
 
--- User Login Logs Policies
+-- Ensure authenticated users cannot tamper with privileged profile columns
+CREATE OR REPLACE FUNCTION public.protect_profile_system_columns()
+RETURNS TRIGGER AS $$
+BEGIN
+  IF auth.role() = 'authenticated' THEN
+    NEW.id := OLD.id;
+    NEW.email := OLD.email;
+    NEW.tier := OLD.tier;
+    NEW.phone_verified := OLD.phone_verified;
+    NEW.storage_limit_bytes := OLD.storage_limit_bytes;
+    NEW.bandwidth_throttle_kbps := OLD.bandwidth_throttle_kbps;
+    NEW.stripe_customer_id := OLD.stripe_customer_id;
+    NEW.stripe_subscription_id := OLD.stripe_subscription_id;
+    NEW.total_watch_seconds := OLD.total_watch_seconds;
+    NEW.total_site_seconds := OLD.total_site_seconds;
+    NEW.total_logins := OLD.total_logins;
+    NEW.created_at := OLD.created_at;
+  END IF;
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER;
+
+DROP TRIGGER IF EXISTS trg_protect_profile_system_columns ON public.profiles;
+CREATE TRIGGER trg_protect_profile_system_columns
+  BEFORE UPDATE ON public.profiles
+  FOR EACH ROW
+  EXECUTE FUNCTION public.protect_profile_system_columns();
+
+-- User Login Logs Policies (Audit log: read-only for authenticated users, insert reserved for server-side service_role)
 DROP POLICY IF EXISTS "user_login_logs_select_own" ON public.user_login_logs;
 CREATE POLICY "user_login_logs_select_own"
   ON public.user_login_logs FOR SELECT
@@ -359,10 +394,7 @@ CREATE POLICY "user_login_logs_select_own"
   USING (auth.uid() = user_id);
 
 DROP POLICY IF EXISTS "user_login_logs_insert_own" ON public.user_login_logs;
-CREATE POLICY "user_login_logs_insert_own"
-  ON public.user_login_logs FOR INSERT
-  TO authenticated
-  WITH CHECK (auth.uid() = user_id);
+REVOKE INSERT ON TABLE public.user_login_logs FROM authenticated, anon;
 
 -- Catalog Policies (Public read for published titles)
 DROP POLICY IF EXISTS "media_items_select_published" ON public.media_items;
@@ -384,13 +416,32 @@ DROP POLICY IF EXISTS "episodes_select_published" ON public.episodes;
 CREATE POLICY "episodes_select_published"
   ON public.episodes FOR SELECT
   TO authenticated
-  USING (is_published = TRUE);
+  USING (
+    is_published = TRUE AND EXISTS (
+      SELECT 1 FROM public.media_items m
+      WHERE m.id = episodes.media_id AND m.is_published = TRUE
+    )
+  );
 
 DROP POLICY IF EXISTS "media_streams_select_ready" ON public.media_streams;
 CREATE POLICY "media_streams_select_ready"
   ON public.media_streams FOR SELECT
   TO authenticated
-  USING (processing_status = 'ready'::processing_status_enum);
+  USING (
+    processing_status = 'ready'::processing_status_enum
+    AND (
+      (media_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.media_items m
+        WHERE m.id = media_streams.media_id AND m.is_published = TRUE
+      ))
+      OR
+      (episode_id IS NOT NULL AND EXISTS (
+        SELECT 1 FROM public.episodes ep
+        JOIN public.media_items m ON m.id = ep.media_id
+        WHERE ep.id = media_streams.episode_id AND ep.is_published = TRUE AND m.is_published = TRUE
+      ))
+    )
+  );
 
 -- User Isolation Policies
 DROP POLICY IF EXISTS "watch_progress_user_isolation" ON public.watch_progress;
@@ -529,7 +580,11 @@ RETURNS TABLE (
   genres TEXT[],
   critic_rating NUMERIC,
   similarity_score REAL
-) AS $$
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path TO 'public'
+AS $$
 DECLARE
   clean_query TEXT := trim(coalesce(search_query, ''));
   escaped_query TEXT;
@@ -600,7 +655,7 @@ BEGIN
     m.views_count DESC
   LIMIT max_results;
 END;
-$$ LANGUAGE plpgsql SECURITY DEFINER;
+$$;
 GRANT EXECUTE ON FUNCTION public.search_media(TEXT, INT) TO anon, authenticated, service_role;
 
 -- 6.5 Admin Inspect Email Auth State (Restricted to service_role)
@@ -764,7 +819,7 @@ DECLARE
   v_safe_site INTEGER := GREATEST(0, LEAST(COALESCE(p_delta_site_seconds, 0), 65));
   v_safe_watch INTEGER := GREATEST(0, LEAST(COALESCE(p_delta_watch_seconds, 0), 65));
   v_target_session_id UUID := p_session_log_id;
-  v_caller_role TEXT := COALESCE(current_setting('request.jwt.claim.role', true), '');
+  v_caller_role TEXT := COALESCE(auth.role(), (current_setting('request.jwt.claims', true)::jsonb ->> 'role'), '');
 BEGIN
   -- Enforce caller authorization: only service_role (backend) or the authenticated user themselves
   IF v_caller_role <> 'service_role' AND (auth.uid() IS NULL OR auth.uid() <> p_user_id) THEN
@@ -850,13 +905,21 @@ REVOKE ALL ON FUNCTION public.record_user_telemetry_heartbeat(uuid, uuid, intege
 GRANT EXECUTE ON FUNCTION public.record_user_telemetry_heartbeat(uuid, uuid, integer, integer, text, text, text) TO authenticated, service_role;
 
 -- 6.9 Sync Watch Progress RPC (With Self-Healing Profiles & Telemetry Integration)
+DROP FUNCTION IF EXISTS public.sync_watch_progress(uuid, uuid, integer, integer, double precision, double precision);
+
 CREATE OR REPLACE FUNCTION public.sync_watch_progress(
   p_media_id uuid,
   p_episode_id uuid,
   p_season_number integer,
   p_episode_number integer,
   p_position_seconds double precision,
-  p_duration_seconds double precision
+  p_duration_seconds double precision,
+  p_audio_index integer DEFAULT NULL,
+  p_audio_lang text DEFAULT NULL,
+  p_audio_label text DEFAULT NULL,
+  p_subtitle_index integer DEFAULT NULL,
+  p_subtitle_lang text DEFAULT NULL,
+  p_subtitle_label text DEFAULT NULL
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -874,9 +937,35 @@ DECLARE
   v_last_seen TIMESTAMPTZ;
   v_latest_session_id UUID;
   v_should_increment BOOLEAN := FALSE;
+  v_audio_idx INT;
+  v_audio_lang TEXT;
+  v_audio_label TEXT;
+  v_sub_idx INT;
+  v_sub_lang TEXT;
+  v_sub_label TEXT;
 BEGIN
   IF v_user_id IS NULL THEN
     RAISE EXCEPTION 'Not authenticated';
+  END IF;
+
+  -- Security Check: Verify media item is published and exists
+  IF NOT EXISTS (
+    SELECT 1 FROM public.media_items
+    WHERE id = p_media_id AND is_published = TRUE
+  ) THEN
+    RAISE EXCEPTION 'Media item not published or does not exist';
+  END IF;
+
+  -- Security Check: If episode_id is provided, verify it is published and belongs to p_media_id
+  IF p_episode_id IS NOT NULL THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM public.episodes
+      WHERE id = p_episode_id
+        AND media_id = p_media_id
+        AND is_published = TRUE
+    ) THEN
+      RAISE EXCEPTION 'Episode not published or media mismatch';
+    END IF;
   END IF;
 
   -- Self-Healing: Guarantee profile row exists in public.profiles
@@ -903,15 +992,36 @@ BEGIN
 
   v_is_completed := (p_duration_seconds > 0) AND (p_position_seconds >= (p_duration_seconds - 30.0) OR (p_position_seconds / p_duration_seconds) >= 0.95);
 
+  -- Determine track preferences based on completion status
+  IF v_is_completed THEN
+    v_audio_idx := NULL;
+    v_audio_lang := NULL;
+    v_audio_label := NULL;
+    v_sub_idx := NULL;
+    v_sub_lang := NULL;
+    v_sub_label := NULL;
+  ELSE
+    v_audio_idx := p_audio_index;
+    v_audio_lang := p_audio_lang;
+    v_audio_label := p_audio_label;
+    v_sub_idx := p_subtitle_index;
+    v_sub_lang := p_subtitle_lang;
+    v_sub_label := p_subtitle_label;
+  END IF;
+
   -- 1. Upsert Watch Progress
   IF p_episode_id IS NOT NULL THEN
     INSERT INTO public.watch_progress (
       user_id, media_id, episode_id, season_number, episode_number,
-      position_seconds, duration_seconds, is_completed, updated_at
+      position_seconds, duration_seconds, is_completed, updated_at,
+      preferred_audio_index, preferred_audio_lang, preferred_audio_label,
+      preferred_subtitle_index, preferred_subtitle_lang, preferred_subtitle_label
     )
     VALUES (
       v_user_id, p_media_id, p_episode_id, v_season_num, v_ep_num,
-      p_position_seconds, p_duration_seconds, v_is_completed, timezone('utc'::text, now())
+      p_position_seconds, p_duration_seconds, v_is_completed, timezone('utc'::text, now()),
+      v_audio_idx, v_audio_lang, v_audio_label,
+      v_sub_idx, v_sub_lang, v_sub_label
     )
     ON CONFLICT (user_id, episode_id) DO UPDATE
     SET
@@ -921,22 +1031,38 @@ BEGIN
       position_seconds = EXCLUDED.position_seconds,
       duration_seconds = EXCLUDED.duration_seconds,
       is_completed = EXCLUDED.is_completed,
-      updated_at = EXCLUDED.updated_at;
+      updated_at = EXCLUDED.updated_at,
+      preferred_audio_index = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_idx, public.watch_progress.preferred_audio_index) END,
+      preferred_audio_lang = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_lang, public.watch_progress.preferred_audio_lang) END,
+      preferred_audio_label = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_label, public.watch_progress.preferred_audio_label) END,
+      preferred_subtitle_index = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_idx, public.watch_progress.preferred_subtitle_index) END,
+      preferred_subtitle_lang = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_lang, public.watch_progress.preferred_subtitle_lang) END,
+      preferred_subtitle_label = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_label, public.watch_progress.preferred_subtitle_label) END;
   ELSE
     INSERT INTO public.watch_progress (
       user_id, media_id, episode_id, season_number, episode_number,
-      position_seconds, duration_seconds, is_completed, updated_at
+      position_seconds, duration_seconds, is_completed, updated_at,
+      preferred_audio_index, preferred_audio_lang, preferred_audio_label,
+      preferred_subtitle_index, preferred_subtitle_lang, preferred_subtitle_label
     )
     VALUES (
       v_user_id, p_media_id, NULL, NULL, NULL,
-      p_position_seconds, p_duration_seconds, v_is_completed, timezone('utc'::text, now())
+      p_position_seconds, p_duration_seconds, v_is_completed, timezone('utc'::text, now()),
+      v_audio_idx, v_audio_lang, v_audio_label,
+      v_sub_idx, v_sub_lang, v_sub_label
     )
     ON CONFLICT (user_id, media_id) WHERE episode_id IS NULL DO UPDATE
     SET
       position_seconds = EXCLUDED.position_seconds,
       duration_seconds = EXCLUDED.duration_seconds,
       is_completed = EXCLUDED.is_completed,
-      updated_at = EXCLUDED.updated_at;
+      updated_at = EXCLUDED.updated_at,
+      preferred_audio_index = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_idx, public.watch_progress.preferred_audio_index) END,
+      preferred_audio_lang = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_lang, public.watch_progress.preferred_audio_lang) END,
+      preferred_audio_label = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_audio_label, public.watch_progress.preferred_audio_label) END,
+      preferred_subtitle_index = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_idx, public.watch_progress.preferred_subtitle_index) END,
+      preferred_subtitle_lang = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_lang, public.watch_progress.preferred_subtitle_lang) END,
+      preferred_subtitle_label = CASE WHEN v_is_completed THEN NULL ELSE COALESCE(v_sub_label, public.watch_progress.preferred_subtitle_label) END;
   END IF;
 
   -- 2. Upsert Watch History
@@ -1038,7 +1164,7 @@ BEGIN
 
 END;
 $$;
-GRANT EXECUTE ON FUNCTION public.sync_watch_progress(uuid, uuid, integer, integer, double precision, double precision) TO authenticated, service_role;
+GRANT EXECUTE ON FUNCTION public.sync_watch_progress(uuid, uuid, integer, integer, double precision, double precision, integer, text, text, integer, text, text) TO authenticated, service_role;
 
 -- 6.10 Get Home Feed Aggregated RPC (High Performance Netflix Home Rails)
 CREATE OR REPLACE FUNCTION public.get_home_feed(current_user_id uuid DEFAULT NULL::uuid)
@@ -1050,10 +1176,13 @@ AS $function$
 DECLARE
   result JSONB;
   effective_user_id UUID;
+  v_caller_role TEXT;
 BEGIN
-  effective_user_id := auth.uid();
-  IF effective_user_id IS NULL AND current_user_id IS NOT NULL THEN
+  v_caller_role := COALESCE(auth.role(), (current_setting('request.jwt.claims', true)::jsonb ->> 'role'), '');
+  IF v_caller_role = 'service_role' THEN
     effective_user_id := current_user_id;
+  ELSE
+    effective_user_id := auth.uid();
   END IF;
 
   SELECT jsonb_build_object(
@@ -1091,8 +1220,9 @@ BEGIN
         ORDER BY wp.media_id, wp.updated_at DESC
       ) wp
       JOIN public.media_items m ON m.id = wp.media_id
-      LEFT JOIN public.episodes ep ON ep.id = wp.episode_id
+      LEFT JOIN public.episodes ep ON (ep.id = wp.episode_id AND ep.media_id = m.id AND ep.is_published = true)
       WHERE m.is_published = true
+        AND (wp.episode_id IS NULL OR (ep.id IS NOT NULL AND ep.is_published = true))
       LIMIT 15
     ), '[]'::jsonb) END,
 
@@ -1166,3 +1296,4 @@ VALUES (1, FALSE, 4, 'auto', 'auto', 2, 2048, FALSE)
 ON CONFLICT (id) DO NOTHING;
 
 NOTIFY pgrst, 'reload schema';
+

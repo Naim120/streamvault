@@ -219,7 +219,7 @@ def extract_one_embedded_subtitle(input_file: str, raw_stream_idx: int, output_v
             "-map", f"0:{raw_stream_idx}",
             "-c:s", "webvtt",
             str(output_vtt)
-        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=60)
         if res.returncode == 0 and output_vtt.is_file() and output_vtt.stat().st_size > 0:
             return True
         return False
@@ -235,7 +235,7 @@ async def check_nvenc_available() -> bool:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        return await proc.wait() == 0
+        return await asyncio.wait_for(proc.wait(), timeout=5.0) == 0
     except Exception:
         return False
 
@@ -250,7 +250,7 @@ async def check_vaapi_available() -> bool:
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL
         )
-        return await proc.wait() == 0
+        return await asyncio.wait_for(proc.wait(), timeout=5.0) == 0
     except Exception:
         return False
 
@@ -292,7 +292,11 @@ async def check_rendition_ready(rendition_dir: Path) -> bool:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL
         )
-        stdout, _ = await proc.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+        except asyncio.TimeoutError:
+            proc.kill()
+            return False
         if proc.returncode == 0 and stdout:
             data = json.loads(stdout.decode("utf-8", errors="ignore"))
             streams = data.get("streams", [])
@@ -1049,6 +1053,21 @@ async def run_lossless_remux(
                 clean_lbl = sanitize_track_label(cfg.get("label") or cfg.get("clean_label"), fallback="")
                 clean_lang = (cfg.get("lang") or "en").strip().lower()[:10]
 
+                incoming_root = Path(settings.MEDIA_INCOMING_DIR).resolve()
+                subs_root = subs_dir.resolve()
+
+                safe_path: Optional[Path] = None
+                raw_path_str = cfg.get("path")
+                if raw_path_str:
+                    cand_p = Path(str(raw_path_str))
+                    resolved_cand = cand_p.resolve()
+                    if not cand_p.is_symlink() and resolved_cand.is_file() and (
+                        resolved_cand.is_relative_to(incoming_root) or resolved_cand.is_relative_to(subs_root)
+                    ):
+                        safe_path = resolved_cand
+                    else:
+                        logger.warning(f"Blocked out-of-bounds subtitle path: {raw_path_str}")
+
                 # Check if this is an already-ingested library subtitle (e.g. English (web) or from existing_vtt_cache)
                 candidate_vtt_names = []
                 for k in ("vtt_path", "url", "vtt_filename", "path"):
@@ -1061,10 +1080,10 @@ async def run_lossless_remux(
                     bool(cached_key) or 
                     cfg.get("source") == "library" or 
                     cfg.get("is_library") or 
-                    (cfg.get("path") and Path(str(cfg.get("path"))).is_file() and "media/library" in str(cfg.get("path")))
+                    (safe_path is not None and safe_path.is_relative_to(subs_root))
                 )
 
-                if is_saved_library and (cached_key or (cfg.get("path") and Path(str(cfg.get("path"))).is_file())):
+                if is_saved_library and (cached_key or (safe_path is not None and safe_path.is_relative_to(subs_root))):
                     # Case B: Already-Ingested Library Subtitle
                     out_idx = len(formatted_subs)
                     vtt_filename = f"sub_{out_idx}_{clean_lang}.vtt"
@@ -1072,8 +1091,8 @@ async def run_lossless_remux(
                     try:
                         if cached_key:
                             dest_vtt.write_text(existing_vtt_cache[cached_key], encoding="utf-8")
-                        elif cfg.get("path") and Path(cfg["path"]).is_file():
-                            raw_b = Path(cfg["path"]).read_bytes()
+                        elif safe_path is not None and safe_path.is_relative_to(subs_root):
+                            raw_b = safe_path.read_bytes()
                             dest_vtt.write_text(convert_subtitle_bytes_to_vtt(raw_b), encoding="utf-8")
                     except Exception as e:
                         logger.warning(f"Error restoring library subtitle {cached_key}: {e}")
@@ -1126,17 +1145,24 @@ async def run_lossless_remux(
                         })
                 elif is_ext:
                     # Case C: Attached External .srt/.vtt file
-                    ext_path_str = cfg.get("path")
-                    if not ext_path_str and cfg.get("ext_id") and input_file:
-                        stem = Path(input_file).stem
-                        custom_dir = Path(settings.MEDIA_INCOMING_DIR) / ".custom_subs" / stem
-                        if custom_dir.exists():
-                            for f in custom_dir.glob(f"{cfg['ext_id']}.*"):
-                                if f.suffix.lower() in (".vtt", ".srt", ".ass"):
-                                    ext_path_str = str(f)
-                                    break
-                    if ext_path_str and Path(ext_path_str).exists():
-                        ext_file = Path(ext_path_str)
+                    ext_file: Optional[Path] = safe_path if (safe_path is not None and safe_path.is_relative_to(incoming_root)) else None
+                    raw_ext_id = cfg.get("ext_id")
+                    if ext_file is None and raw_ext_id and input_file:
+                        if not re.fullmatch(r"[\w\-]+", str(raw_ext_id)):
+                            logger.warning(f"Blocked invalid subtitle ext_id: {raw_ext_id}")
+                            continue
+                        safe_stem = re.sub(r"[^\w\-.]", "_", Path(input_file).stem)
+                        for stem_cand in (safe_stem, Path(input_file).stem):
+                            custom_dir = (incoming_root / ".custom_subs" / stem_cand).resolve()
+                            if custom_dir.is_relative_to(incoming_root) and custom_dir.is_dir():
+                                for f in custom_dir.glob(f"{raw_ext_id}.*"):
+                                    rf = f.resolve()
+                                    if not f.is_symlink() and rf.is_relative_to(incoming_root) and rf.is_file() and rf.suffix.lower() in (".vtt", ".srt", ".ass"):
+                                        ext_file = rf
+                                        break
+                            if ext_file is not None:
+                                break
+                    if ext_file is not None:
                         out_idx = len(formatted_subs)
                         vtt_filename = f"sub_{out_idx}_{clean_lang}.vtt"
                         dest_vtt = subs_dir / vtt_filename
@@ -1144,6 +1170,8 @@ async def run_lossless_remux(
                             raw_b = ext_file.read_bytes()
                             vtt_text = convert_subtitle_bytes_to_vtt(raw_b)
                             dest_vtt.write_text(vtt_text, encoding="utf-8")
+                        except Exception as e:
+                            logger.warning(f"Error copying external subtitle {ext_file}: {e}")
                         except Exception as e:
                             logger.warning(f"Error copying external subtitle {ext_path_str}: {e}")
 
@@ -1230,8 +1258,11 @@ async def run_lossless_remux(
                 in_p = Path(input_file)
                 in_dir = in_p.parent
                 in_stem = in_p.stem
+                incoming_root = Path(settings.MEDIA_INCOMING_DIR).resolve()
                 for ext in (".srt", ".vtt", ".ass"):
                     for sub_f in in_dir.glob(f"*{ext}"):
+                        if sub_f.is_symlink() or not sub_f.resolve().is_relative_to(incoming_root) or not sub_f.is_file():
+                            continue
                         if sub_f.name.startswith(in_stem):
                             sub_out_idx = len(formatted_subs)
                             sub_suffix = sub_f.stem.replace(in_stem, "").strip("._- ")
@@ -1268,13 +1299,11 @@ async def run_lossless_remux(
     # Auto-clean staged .custom_subs/{video_stem} upon ingest completion
     if input_file:
         try:
-            in_stem = Path(input_file).stem
-            safe_stem = re.sub(r"[^\w\-.]", "_", in_stem)
-            staged_dir_1 = Path(settings.MEDIA_INCOMING_DIR) / ".custom_subs" / in_stem
-            staged_dir_2 = Path(settings.MEDIA_INCOMING_DIR) / ".custom_subs" / safe_stem
-            shutil.rmtree(staged_dir_1, ignore_errors=True)
-            if staged_dir_2 != staged_dir_1:
-                shutil.rmtree(staged_dir_2, ignore_errors=True)
+            incoming_subs = (Path(settings.MEDIA_INCOMING_DIR) / ".custom_subs").resolve()
+            safe_stem = re.sub(r"[^\w\-.]", "_", Path(input_file).stem)
+            staged_dir = (incoming_subs / safe_stem).resolve()
+            if staged_dir.is_relative_to(incoming_subs) and staged_dir.exists() and staged_dir.is_dir():
+                shutil.rmtree(staged_dir, ignore_errors=True)
         except Exception as e:
             logger.warning(f"Error cleaning staged custom subs for {input_file}: {e}")
 

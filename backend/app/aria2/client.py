@@ -14,10 +14,15 @@ class Aria2RPCClient:
         self.endpoint = f"{protocol}://{settings.ARIA2_RPC_HOST}:{settings.ARIA2_RPC_PORT}/jsonrpc"
         self.secret = settings.ARIA2_RPC_SECRET
 
+    @property
+    def rpc_secret(self) -> str:
+        return self.secret or settings.ARIA2_RPC_SECRET
+
     async def call(self, method: str, params: Optional[List[Any]] = None) -> Any:
         payload_params = []
-        if self.secret:
-            payload_params.append(f"token:{self.secret}")
+        secret = self.rpc_secret
+        if secret:
+            payload_params.append(f"token:{secret}")
         if params:
             payload_params.extend(params)
 
@@ -55,6 +60,9 @@ class Aria2RPCClient:
         opts.setdefault("seed-time", "0")
         opts.setdefault("bt-stop-timeout", "600")
         opts.setdefault("follow-torrent", "mem")
+        proxy = getattr(settings, "ARIA2_EGRESS_PROXY", "")
+        if proxy and "all-proxy" not in opts:
+            opts["all-proxy"] = proxy
         params = [uris, opts]
         return await self.call("addUri", params)
 
@@ -68,6 +76,9 @@ class Aria2RPCClient:
         opts.setdefault("seed-time", "0")
         opts.setdefault("bt-stop-timeout", "600")
         opts.setdefault("follow-torrent", "mem")
+        proxy = getattr(settings, "ARIA2_EGRESS_PROXY", "")
+        if proxy and "all-proxy" not in opts:
+            opts["all-proxy"] = proxy
         b64_content = base64.b64encode(torrent_bytes).decode("utf-8")
         params = [b64_content, [], opts]
         return await self.call("addTorrent", params)
@@ -76,7 +87,8 @@ class Aria2RPCClient:
         """
         Executes multiple Aria2 JSON-RPC methods in a single HTTP POST via system.multicall.
         """
-        token_prefix = [f"token:{self.secret}"] if self.secret else []
+        secret = self.rpc_secret
+        token_prefix = [f"token:{secret}"] if secret else []
         calls = []
         for m in methods:
             m_name = m.get("methodName", "")

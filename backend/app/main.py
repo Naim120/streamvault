@@ -1,7 +1,9 @@
 import collections
 import hmac
+import json
 import logging
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
@@ -17,7 +19,7 @@ from .api import stream, system, telemetry, aria2, metadata, auth_guard, auth
 from .transcoder.worker import transcode_queue
 from .aria2.monitor import aria2_monitor
 from .utils.process_identity import set_process_identity, ensure_branded_symlinks
-from .security import extract_trusted_client_ip
+from .security import extract_trusted_client_ip, get_active_cloudflared_origin
 
 # Configure logging
 logging.basicConfig(
@@ -68,6 +70,11 @@ async def lifespan(app: FastAPI):
     yield
     # Shutdown sequence
     logger.info("Shutting down StreamVault Media Server...")
+    from .database import db
+    try:
+        await db.aclose()
+    except Exception:
+        pass
     if transcode_queue.worker_task and not transcode_queue.worker_task.done():
         transcode_queue.worker_task.cancel()
     if aria2_monitor.monitor_task and not aria2_monitor.monitor_task.done():
@@ -158,7 +165,11 @@ class SlidingWindowRateLimiterMiddleware(BaseHTTPMiddleware):
             or request.headers.get("X-Real-IP")
         )
         admin_secret_hdr = request.headers.get("X-Admin-Secret", "").strip()
-        configured_secret = (getattr(settings, "ADMIN_API_SECRET", "") or os.getenv("ADMIN_API_SECRET", "")).strip()
+        configured_secret = (
+            getattr(settings, "ADMIN_API_SECRET", "")
+            or os.getenv("ADMIN_API_SECRET", "")
+            or os.getenv("ADMIN_SECRET", "")
+        ).strip()
 
         is_authenticated_admin_loopback = (
             is_loopback
@@ -207,28 +218,81 @@ class SlidingWindowRateLimiterMiddleware(BaseHTTPMiddleware):
 
         return await call_next(request)
 
-# 2. Request Body Size Limit Middleware (15MB for torrents, 64KB for JSON)
-class RequestSizeLimitMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        if request.method in ("POST", "PUT", "PATCH"):
-            cl_header = request.headers.get("content-length")
-            if cl_header:
+class _PayloadTooLargeError(Exception):
+    pass
+
+# Pure ASGI Request Body Size Limit Middleware (15MB for torrents/uploads, 64KB for JSON)
+class RequestSizeLimitMiddleware:
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("method") in ("POST", "PUT", "PATCH"):
+            path = scope.get("path", "")
+            is_upload = "/add" in path or "/torrent" in path or "/upload" in path or "/subtitles" in path
+            max_bytes = (15 * 1024 * 1024) if is_upload else (64 * 1024)
+            headers = dict(scope.get("headers", []))
+            cl = headers.get(b"content-length")
+            if cl:
                 try:
-                    cl_bytes = int(cl_header)
+                    cl_bytes = int(cl)
                 except ValueError:
-                    cl_bytes = 0
-
-                path = request.url.path
-                is_upload_route = "/add" in path or "/torrent" in path or "/upload" in path
-                max_bytes = (15 * 1024 * 1024) if is_upload_route else (64 * 1024)
-
-                if cl_bytes > max_bytes:
-                    return JSONResponse(
-                        status_code=413,
-                        content={"detail": f"Payload Too Large: Content-Length exceeds maximum limit ({max_bytes} bytes)"}
+                    resp = Response(status_code=400, content=json.dumps({"detail": "Invalid Content-Length"}), media_type="application/json")
+                    await resp(scope, receive, send)
+                    return
+                if cl_bytes < 0 or cl_bytes > max_bytes:
+                    resp = Response(
+                        status_code=413 if cl_bytes > max_bytes else 400,
+                        content=json.dumps({"detail": f"Payload Too Large (max {max_bytes} bytes)" if cl_bytes > max_bytes else "Invalid Content-Length"}),
+                        media_type="application/json"
                     )
+                    await resp(scope, receive, send)
+                    return
 
-        return await call_next(request)
+            total = 0
+            exceeded = False
+            response_started = False
+
+            async def limited_receive():
+                nonlocal total, exceeded
+                msg = await receive()
+                if msg["type"] == "http.request":
+                    total += len(msg.get("body", b""))
+                    if total > max_bytes:
+                        exceeded = True
+                        raise _PayloadTooLargeError()
+                return msg
+
+            async def tracked_send(message):
+                nonlocal response_started
+                if exceeded and message["type"] in ("http.response.start", "http.response.body"):
+                    return
+                if message["type"] == "http.response.start":
+                    response_started = True
+                await send(message)
+
+            try:
+                await self.app(scope, limited_receive, tracked_send)
+            except* _PayloadTooLargeError:
+                pass
+
+            if exceeded and not response_started:
+                resp = Response(
+                    status_code=413,
+                    content=json.dumps({"detail": f"Payload Too Large (max {max_bytes} bytes)"}),
+                    media_type="application/json"
+                )
+                await resp(scope, receive, send)
+            return
+
+        await self.app(scope, receive, send)
+
+def _safe_base_url(request: Request) -> str:
+    raw_proto = (request.headers.get("X-Forwarded-Proto") or "").strip().lower()
+    scheme = raw_proto if raw_proto in ("http", "https") else (request.url.scheme if request.url.scheme in ("http", "https") else "http")
+    raw_host = (request.headers.get("Host") or request.url.netloc or "localhost:8080").strip()
+    host = raw_host if re.fullmatch(r"[A-Za-z0-9.\-:[\]]+", raw_host) else "localhost:8080"
+    return f"{scheme}://{host}".rstrip("/")
 
 # Build Dynamic CSP Directives (single-origin relative routing)
 _csp_connect = [
@@ -240,7 +304,6 @@ _csp_connect = [
     "https://ipv4.icanhazip.com",
     "https://ipv6.icanhazip.com",
     "capacitor://localhost",
-    "https://*.trycloudflare.com",
     "http://192.168.*:*",
 ]
 
@@ -248,7 +311,6 @@ _csp_media = [
     "'self'",
     "blob:",
     "capacitor://localhost",
-    "https://*.trycloudflare.com",
     "http://192.168.*:*",
 ]
 
@@ -266,30 +328,6 @@ for _ext in (
         if _val not in _csp_media:
             _csp_media.append(_val)
 
-DYNAMIC_CSP_HEADER = (
-    "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline'; "
-    "style-src 'self' 'unsafe-inline'; "
-    "img-src 'self' data: https://image.tmdb.org https://*.media-amazon.com https://images.unsplash.com; "
-    f"media-src {' '.join(_csp_media)}; "
-    f"connect-src {' '.join(_csp_connect)}; "
-    "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
-    "object-src 'none'; "
-    "base-uri 'self';"
-)
-
-DOCS_CSP_HEADER = (
-    "default-src 'self'; "
-    "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fastapi.tiangolo.com; "
-    "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fastapi.tiangolo.com; "
-    "img-src 'self' data: https://cdn.jsdelivr.net https://fastapi.tiangolo.com https://image.tmdb.org https://*.media-amazon.com https://images.unsplash.com; "
-    f"media-src {' '.join(_csp_media)}; "
-    f"connect-src {' '.join(_csp_connect)}; "
-    "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
-    "object-src 'none'; "
-    "base-uri 'self';"
-)
-
 # 3. StreamVault Security & Production Headers Middleware
 class StreamVaultSecurityHeadersMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
@@ -300,10 +338,33 @@ class StreamVaultSecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+
+        active_cf = get_active_cloudflared_origin()
+        extra_cf = f" {active_cf}" if active_cf else ""
         if request.url.path in ("/api/docs", "/api/redoc", "/api/openapi.json"):
-            response.headers["Content-Security-Policy"] = DOCS_CSP_HEADER
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fastapi.tiangolo.com; "
+                "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net https://fastapi.tiangolo.com; "
+                "img-src 'self' data: https://cdn.jsdelivr.net https://fastapi.tiangolo.com https://image.tmdb.org https://*.media-amazon.com https://images.unsplash.com; "
+                f"media-src {' '.join(_csp_media)}{extra_cf}; "
+                f"connect-src {' '.join(_csp_connect)}{extra_cf}; "
+                "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
+                "object-src 'none'; "
+                "base-uri 'self';"
+            )
         else:
-            response.headers["Content-Security-Policy"] = DYNAMIC_CSP_HEADER
+            response.headers["Content-Security-Policy"] = (
+                "default-src 'self'; "
+                "script-src 'self' 'unsafe-inline'; "
+                "style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data: https://image.tmdb.org https://*.media-amazon.com https://images.unsplash.com; "
+                f"media-src {' '.join(_csp_media)}{extra_cf}; "
+                f"connect-src {' '.join(_csp_connect)}{extra_cf}; "
+                "frame-src https://www.youtube.com https://www.youtube-nocookie.com; "
+                "object-src 'none'; "
+                "base-uri 'self';"
+            )
         return response
 
 app.add_middleware(StreamVaultSecurityHeadersMiddleware)
@@ -333,10 +394,27 @@ frontend_env_origin = os.getenv("FRONTEND_ORIGIN")
 if frontend_env_origin and frontend_env_origin not in ALLOWED_ORIGINS:
     ALLOWED_ORIGINS.append(frontend_env_origin.strip())
 
+
+class DynamicCORSMiddleware(CORSMiddleware):
+    """
+    Statically allows approved origins and LAN subnets.
+    Only allows a trycloudflare.com origin if it matches THIS host's active tunnel,
+    rejecting any third-party attacker-controlled *.trycloudflare.com tunnels.
+    """
+    def is_allowed_origin(self, origin: str) -> bool:
+        if super().is_allowed_origin(origin):
+            return True
+        if origin and "trycloudflare.com" in origin:
+            active_tunnel = get_active_cloudflared_origin()
+            if active_tunnel and origin.rstrip("/") == active_tunnel.rstrip("/"):
+                return True
+        return False
+
+
 app.add_middleware(
-    CORSMiddleware,
+    DynamicCORSMiddleware,
     allow_origins=ALLOWED_ORIGINS,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|100\.\d+\.\d+\.\d+|.*\.trycloudflare\.com)(:\d+)?$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1|192\.168\.\d+\.\d+|100\.\d+\.\d+\.\d+)(:\d+)?$",
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"],
     allow_headers=["*"],
@@ -362,17 +440,18 @@ async def root():
     return resp
 
 @app.get("/health")
+@app.get("/api/health")
 async def health_check():
     return {
         "status": "healthy",
         "transcode_queue": transcode_queue.get_status()
     }
 
-@app.get("/sitemap.xml")
+@app.api_route("/sitemap.xml", methods=["GET", "HEAD"])
 async def get_sitemap(request: Request):
-    scheme = request.headers.get("X-Forwarded-Proto") or request.url.scheme or "http"
-    host = request.headers.get("Host") or request.url.netloc or "localhost:8080"
-    base_url = f"{scheme}://{host}".rstrip("/")
+    if request.method == "HEAD":
+        return Response(status_code=200, media_type="application/xml")
+    base_url = _safe_base_url(request)
 
     xml_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
@@ -406,9 +485,7 @@ async def get_sitemap(request: Request):
 
 @app.get("/robots.txt")
 async def get_robots(request: Request):
-    scheme = request.headers.get("X-Forwarded-Proto") or request.url.scheme or "http"
-    host = request.headers.get("Host") or request.url.netloc or "localhost:8080"
-    base_url = f"{scheme}://{host}".rstrip("/")
+    base_url = _safe_base_url(request)
     content = f"""User-agent: *
 Allow: /
 Allow: /legal/

@@ -154,7 +154,7 @@ class EpisodeMetadataUpdate(BaseModel):
             raise ValueError("Thumbnail URL must begin with https://, http://localhost:, http://127.0.0.1:, or /media/.")
         return url
 
-@router.get("/search")
+@router.get("/search", dependencies=[Depends(require_admin_secret)])
 async def search_tmdb(
     query: str = Query(..., min_length=1),
     type: str = Query("multi", pattern="^(movie|tv|multi)$")
@@ -167,7 +167,7 @@ async def search_tmdb(
         return []
     return await tmdb_client.search(query=clean_query, media_type=type)
 
-@router.get("/details/{tmdb_id}")
+@router.get("/details/{tmdb_id}", dependencies=[Depends(require_admin_secret)])
 async def get_tmdb_details(
     tmdb_id: int,
     type: str = Query("movie", pattern="^(movie|series|tv)$")
@@ -230,9 +230,14 @@ def invalidate_catalog_cache():
     global _catalog_cache, _search_query_cache
     _catalog_cache["last_fetched"] = 0.0
     _search_query_cache.clear()
+    try:
+        from .stream import _SERIES_EPISODE_CACHE
+        _SERIES_EPISODE_CACHE.clear()
+    except Exception:
+        pass
 
 async def get_cached_catalog_data(force: bool = False):
-    global _catalog_cache
+    global _catalog_cache, _search_query_cache
     now = time.time()
     if not force and (now - _catalog_cache["last_fetched"] < CATALOG_CACHE_TTL):
         return _catalog_cache["media_items"], _catalog_cache["episodes"], _catalog_cache.get("media_streams", [])
@@ -245,6 +250,7 @@ async def get_cached_catalog_data(force: bool = False):
         _catalog_cache["episodes"] = episodes or []
         _catalog_cache["media_streams"] = media_streams or []
         _catalog_cache["last_fetched"] = now
+        _search_query_cache.clear()
     except Exception as e:
         logger.warning(f"Failed to refresh catalog cache from Supabase: {e}")
     return _catalog_cache["media_items"], _catalog_cache["episodes"], _catalog_cache.get("media_streams", [])
@@ -260,6 +266,9 @@ async def search_catalog(
     Ultra-fast in-memory scored catalog search with sub-millisecond LRU cache,
     returning published media items sorted by relevance with strict word-boundary matching.
     """
+    now = time.time()
+    if now - _catalog_cache.get("last_fetched", 0.0) >= CATALOG_CACHE_TTL:
+        await get_cached_catalog_data()
     version = get_catalog_version()
     raw_query = q or ""
     q_norm = sanitize_search_query(raw_query)
@@ -796,14 +805,20 @@ async def probe_incoming_file_stream(filename: str):
         custom_subs_dir = incoming / ".custom_subs" / target_file.stem
 
     if custom_subs_dir.exists():
+        incoming_root = incoming.resolve()
         for meta_file in sorted(custom_subs_dir.glob("*.meta.json")):
             try:
                 meta = json.loads(meta_file.read_text(encoding="utf-8"))
-                vtt_file = custom_subs_dir / f"{meta['ext_id']}.vtt"
+                ext_id = str(meta.get("ext_id", ""))
+                if not re.match(r"^[\w\-]+$", ext_id):
+                    continue
+                vtt_file = custom_subs_dir / f"{ext_id}.vtt"
+                if vtt_file.is_symlink() or not vtt_file.is_file() or not vtt_file.resolve().is_relative_to(incoming_root):
+                    continue
                 if vtt_file.exists() and vtt_file.stat().st_size > 0:
                     staged_external_subtitles.append({
-                        "id": meta["ext_id"],
-                        "ext_id": meta["ext_id"],
+                        "id": ext_id,
+                        "ext_id": ext_id,
                         "raw_stream_idx": -1,
                         "filename": meta.get("filename") or vtt_file.name,
                         "path": str(vtt_file),
@@ -819,8 +834,11 @@ async def probe_incoming_file_stream(filename: str):
     # Discover companion subtitles next to video in incoming folder
     try:
         in_stem = target_file.stem
+        incoming_root = incoming.resolve()
         for ext in (".srt", ".vtt", ".ass"):
             for comp_f in target_file.parent.glob(f"*{ext}"):
+                if comp_f.is_symlink() or not comp_f.is_file() or not comp_f.resolve().is_relative_to(incoming_root):
+                    continue
                 if comp_f.name.startswith(in_stem) and not any(es["filename"] == comp_f.name for es in staged_external_subtitles):
                     comp_suffix = comp_f.stem.replace(in_stem, "").strip("._- ")
                     comp_code = comp_suffix.lower()[:3] if comp_suffix else "en"
@@ -1079,13 +1097,27 @@ async def bulk_delete_media_items(payload: BulkDeletePayload):
                     logger.warning(f"Failed to unlink raw incoming file {raw_file}: {e}")
 
             # Clean custom subs directory if exists
+            raw_custom_subs_root = incoming / ".custom_subs"
+            custom_subs_root = raw_custom_subs_root.resolve()
             safe_stem = re.sub(r"[^\w\-.]", "_", Path(item.filename).stem)
-            subs_dir = (incoming / ".custom_subs" / safe_stem).resolve()
-            if subs_dir.is_relative_to(incoming) and subs_dir.exists() and subs_dir.is_dir():
-                try:
-                    shutil.rmtree(subs_dir, ignore_errors=True)
-                except Exception:
-                    pass
+            if (
+                not raw_custom_subs_root.is_symlink()
+                and custom_subs_root.parent == incoming
+                and safe_stem not in ("", ".", "..")
+            ):
+                candidate_dir = raw_custom_subs_root / safe_stem
+                if not candidate_dir.is_symlink():
+                    subs_dir = candidate_dir.resolve()
+                    if (
+                        subs_dir.is_relative_to(custom_subs_root)
+                        and subs_dir != custom_subs_root
+                        and subs_dir.exists()
+                        and subs_dir.is_dir()
+                    ):
+                        try:
+                            shutil.rmtree(subs_dir, ignore_errors=True)
+                        except Exception:
+                            pass
 
         # 2. Determine if matched in library/database and delete DB records & HLS stream
         ep_id = item.episode_id
@@ -1738,44 +1770,65 @@ async def get_stream_tracks(target_id: str, request: Request):
     except (ValueError, AttributeError):
         raise HTTPException(status_code=400, detail="Invalid target_id UUID")
 
-    admin_sec = request.headers.get("x-admin-secret", "")
-    is_admin = bool(admin_sec and getattr(settings, "ADMIN_API_SECRET", None) and hmac.compare_digest(admin_sec, settings.ADMIN_API_SECRET))
+    admin_sec = request.headers.get("x-admin-secret")
+    if admin_sec is not None:
+        await require_admin_secret(request, admin_sec)
+        is_admin = True
+    else:
+        is_admin = False
+
     if not is_admin:
         is_pub = await check_media_published(valid_uuid)
         if not is_pub:
             raise HTTPException(status_code=404, detail="Media stream not found or unavailable")
 
-    rows = await db.select("media_streams", {"episode_id": f"eq.{valid_uuid}"})
+    stream_query_ep = {"episode_id": f"eq.{valid_uuid}"}
+    stream_query_med = {"media_id": f"eq.{valid_uuid}"}
+    if not is_admin:
+        stream_query_ep["processing_status"] = "eq.ready"
+        stream_query_med["processing_status"] = "eq.ready"
+
+    rows = await db.select("media_streams", stream_query_ep)
     if not rows:
-        rows = await db.select("media_streams", {"media_id": f"eq.{valid_uuid}"})
+        rows = await db.select("media_streams", stream_query_med)
     if not rows:
         # Check if target_id is a series or movie without a direct stream record yet
         media_rows = await db.select("media_items", {"id": f"eq.{valid_uuid}"})
         if media_rows:
             media_item = media_rows[0]
+            if not is_admin and not media_item.get("is_published", False):
+                raise HTTPException(status_code=404, detail="Media stream not found for target_id")
             if media_item.get("type") == "series":
-                episodes = await db.select("episodes", {"media_id": f"eq.{valid_uuid}", "order": "season_number.asc,episode_number.asc"})
+                ep_query = {"media_id": f"eq.{valid_uuid}", "order": "season_number.asc,episode_number.asc"}
+                if not is_admin:
+                    ep_query["is_published"] = "eq.true"
+                episodes = await db.select("episodes", ep_query)
                 for ep in (episodes or []):
-                    ep_streams = await db.select("media_streams", {"episode_id": f"eq.{ep.get('id')}"})
+                    ep_stream_query = {"episode_id": f"eq.{ep.get('id')}"}
+                    if not is_admin:
+                        ep_stream_query["processing_status"] = "eq.ready"
+                    ep_streams = await db.select("media_streams", ep_stream_query)
                     if ep_streams and (ep_streams[0].get("audio_tracks") or ep_streams[0].get("subtitle_tracks")):
                         row = ep_streams[0]
                         clean_audio = [
                             {
-                                **a,
-                                "label": sanitize_track_label(a.get("label"), fallback=f"Audio Track {(a.get('index') or 0) + 1}"),
-                                "is_default": bool(a.get("is_default", False))
+                                k: v for k, v in a.items() if k != "path"
                             }
                             for a in (row.get("audio_tracks") or [])
                         ]
+                        for a in clean_audio:
+                            a["label"] = sanitize_track_label(a.get("label"), fallback=f"Audio Track {(a.get('index') or 0) + 1}")
+                            a["is_default"] = bool(a.get("is_default", False))
                         if clean_audio and not any(a.get("is_default") for a in clean_audio):
                             clean_audio[0]["is_default"] = True
                         clean_subs = [
                             {
-                                **s,
-                                "label": sanitize_track_label(s.get("label"), fallback=f"Subtitle {(s.get('index') or 0) + 1}")
+                                k: v for k, v in s.items() if k != "path"
                             }
                             for s in (row.get("subtitle_tracks") or [])
                         ]
+                        for s in clean_subs:
+                            s["label"] = sanitize_track_label(s.get("label"), fallback=f"Subtitle {(s.get('index') or 0) + 1}")
                         target_dir = Path(settings.MEDIA_LIBRARY_DIR) / str(ep.get('id'))
                         dur_sec = get_hls_playlist_duration(target_dir)
                         return {
@@ -1797,22 +1850,24 @@ async def get_stream_tracks(target_id: str, request: Request):
     row = rows[0]
     clean_audio = [
         {
-            **a,
-            "label": sanitize_track_label(a.get("label"), fallback=f"Audio Track {(a.get('index') or 0) + 1}"),
-            "is_default": bool(a.get("is_default", False))
+            k: v for k, v in a.items() if k != "path"
         }
         for a in (row.get("audio_tracks") or [])
     ]
+    for a in clean_audio:
+        a["label"] = sanitize_track_label(a.get("label"), fallback=f"Audio Track {(a.get('index') or 0) + 1}")
+        a["is_default"] = bool(a.get("is_default", False))
     if clean_audio and not any(a.get("is_default") for a in clean_audio):
         clean_audio[0]["is_default"] = True
 
     clean_subs = [
         {
-            **s,
-            "label": sanitize_track_label(s.get("label"), fallback=f"Subtitle {(s.get('index') or 0) + 1}")
+            k: v for k, v in s.items() if k != "path"
         }
         for s in (row.get("subtitle_tracks") or [])
     ]
+    for s in clean_subs:
+        s["label"] = sanitize_track_label(s.get("label"), fallback=f"Subtitle {(s.get('index') or 0) + 1}")
     target_dir = Path(settings.MEDIA_LIBRARY_DIR) / valid_uuid
     dur_sec = get_hls_playlist_duration(target_dir)
     return {

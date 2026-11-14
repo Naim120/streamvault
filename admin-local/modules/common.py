@@ -23,7 +23,11 @@ from backend.app.config import settings
 from backend.app.database import db
 
 MEDIA_SERVER_URL = os.getenv("MEDIA_SERVER_INTERNAL_URL", f"http://127.0.0.1:{settings.MEDIA_SERVER_PORT}")
-ADMIN_SECRET = settings.ADMIN_API_SECRET
+ADMIN_SECRET = (
+    getattr(settings, "ADMIN_API_SECRET", "")
+    or os.getenv("ADMIN_API_SECRET", "")
+    or os.getenv("ADMIN_SECRET", "")
+).strip()
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 STATIC_DIR.mkdir(parents=True, exist_ok=True)

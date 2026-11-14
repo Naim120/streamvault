@@ -6,7 +6,7 @@ import { supabase } from '../../lib/supabase';
 import { sanitizeAuthError } from '../../lib/errorHandler';
 
 export const ResetPasswordScreen: React.FC = () => {
-  const { user, updatePassword, cancelPasswordRecovery } = useAuthStore();
+  const { user, updatePassword, setPasswordRecovery, cancelPasswordRecovery } = useAuthStore();
   const { showToast } = useUIStore();
 
   const [password, setPassword] = useState('');
@@ -56,6 +56,7 @@ export const ResetPasswordScreen: React.FC = () => {
       return;
     }
 
+    const activeEmail = user?.email || '';
     setLoading(true);
     const res = await updatePassword(password);
     setLoading(false);
@@ -63,8 +64,26 @@ export const ResetPasswordScreen: React.FC = () => {
     if (res.error) {
       setError(sanitizeAuthError(res.error));
     } else {
+      try {
+        const bc = new BroadcastChannel('sv_auth_channel');
+        bc.postMessage({ type: 'SV_PASSWORD_RESET_COMPLETED', email: activeEmail, timestamp: Date.now() });
+        bc.close();
+      } catch {}
+      try {
+        localStorage.setItem('sv_password_reset_completed', JSON.stringify({ email: activeEmail, timestamp: Date.now() }));
+      } catch {}
+
+      setPasswordRecovery(false);
       cleanAuthUrlParams();
-      showToast('✓ Password updated successfully! Welcome back.');
+      if (useAuthStore.getState().user) {
+        window.history.replaceState({}, '', '/home');
+        window.dispatchEvent(new Event('sv:navigation'));
+        showToast('✓ Password updated successfully! Welcome back.');
+      } else {
+        window.history.replaceState({}, '', '/');
+        window.dispatchEvent(new Event('sv:navigation'));
+        showToast('✓ Password updated successfully! Please sign in with your new password.');
+      }
     }
   };
 

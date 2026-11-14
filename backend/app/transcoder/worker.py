@@ -22,6 +22,11 @@ class TranscodeJob:
     custom_subtitle_tracks: Optional[List[Dict[str, Any]]] = None
     force_video_reencode: bool = False
     parent_media_id: Optional[str] = None
+    media_type: str = "movie"
+
+    @property
+    def filename(self) -> str:
+        return Path(self.input_file_path).name if self.input_file_path else ""
 
 import os
 import signal
@@ -137,6 +142,13 @@ class TranscodeQueueManager:
             "message": "Transcoding job cancelled and partial segments cleaned."
         }
 
+    @property
+    def pending_jobs(self) -> List[TranscodeJob]:
+        try:
+            return list(self.queue._queue)
+        except Exception:
+            return []
+
     async def enqueue(self, job: TranscodeJob) -> bool:
         try:
             self.queue.put_nowait(job)
@@ -149,14 +161,18 @@ class TranscodeQueueManager:
     def get_status(self) -> Dict[str, Any]:
         queued_jobs = []
         try:
-            for j in list(self.queue._queue):
+            for idx, j in enumerate(list(self.queue._queue)):
                 queued_jobs.append({
                     "job_id": j.job_id,
                     "title": j.title,
                     "filename": Path(j.input_file_path).name if j.input_file_path else "",
                     "input_file_path": j.input_file_path,
                     "media_id": j.media_id,
-                    "episode_id": j.episode_id
+                    "episode_id": j.episode_id,
+                    "media_type": getattr(j, "media_type", "series" if j.episode_id else "movie"),
+                    "position": idx + 1,
+                    "audio_count": len(j.custom_audio_tracks) if j.custom_audio_tracks else 0,
+                    "sub_count": len(j.custom_subtitle_tracks) if j.custom_subtitle_tracks else 0
                 })
         except Exception as e:
             logger.warning(f"Error inspecting queued jobs: {e}")
@@ -171,11 +187,117 @@ class TranscodeQueueManager:
                 "input_file_path": self.active_job.input_file_path,
                 "media_id": self.active_job.media_id,
                 "episode_id": self.active_job.episode_id,
+                "media_type": getattr(self.active_job, "media_type", "series" if self.active_job.episode_id else "movie"),
                 "progress_pct": round(self.current_progress_pct, 1),
-                "stage": self.current_stage
+                "stage": self.current_stage,
+                "audio_count": len(self.active_job.custom_audio_tracks) if self.active_job.custom_audio_tracks else 0,
+                "sub_count": len(self.active_job.custom_subtitle_tracks) if self.active_job.custom_subtitle_tracks else 0
             } if self.active_job else None,
             "queued_jobs": queued_jobs
         }
+
+    async def cancel_queued_job(self, identifier: str) -> Dict[str, Any]:
+        """
+        Removes a queued job before it starts executing and cleans up placeholder DB records.
+        Matches by job_id, filename, full path, media_id, or episode_id.
+        """
+        target_job: Optional[TranscodeJob] = None
+        new_queue = []
+        for j in list(self.queue._queue):
+            fname = Path(j.input_file_path).name if j.input_file_path else ""
+            if (target_job is None and 
+                (j.job_id == identifier or 
+                 fname == identifier or 
+                 j.input_file_path == identifier or
+                 j.media_id == identifier or 
+                 j.episode_id == identifier)):
+                target_job = j
+            else:
+                new_queue.append(j)
+
+        if not target_job:
+            return {"status": "not_found", "message": f"Job '{identifier}' not found in waiting queue."}
+
+        # Rebuild queue deque
+        self.queue._queue.clear()
+        for item in new_queue:
+            self.queue._queue.append(item)
+        if hasattr(self.queue, "_unfinished_tasks"):
+            self.queue._unfinished_tasks = max(0, self.queue._unfinished_tasks - 1)
+
+        logger.warning(f"Cancelled waiting queued job {target_job.job_id} ({target_job.title}, {target_job.filename})")
+        await self._cleanup_cancelled_queued_job(target_job)
+
+        return {
+            "status": "cancelled",
+            "message": f"Queued job for '{target_job.title}' ({target_job.filename}) was removed from queue.",
+            "job_id": target_job.job_id,
+            "filename": target_job.filename,
+            "remaining_queue_length": self.queue.qsize()
+        }
+
+    async def cancel_all_queued_jobs(self) -> Dict[str, Any]:
+        """
+        Clears all waiting jobs from the queue and cleans up placeholder DB records.
+        """
+        cancelled_jobs = list(self.queue._queue)
+        self.queue._queue.clear()
+        if hasattr(self.queue, "_unfinished_tasks"):
+            self.queue._unfinished_tasks = 0
+
+        for j in cancelled_jobs:
+            try:
+                await self._cleanup_cancelled_queued_job(j)
+            except Exception as e:
+                logger.warning(f"Error cleaning up queued job {j.job_id}: {e}")
+
+        logger.warning(f"Cancelled all {len(cancelled_jobs)} waiting jobs in transcode queue.")
+        return {
+            "status": "cleared",
+            "message": f"Cleared {len(cancelled_jobs)} waiting job(s) from queue.",
+            "cancelled_count": len(cancelled_jobs)
+        }
+
+    async def _cleanup_cancelled_queued_job(self, job: TranscodeJob):
+        """
+        Safely restores or purges DB records for a cancelled queued job:
+        - If re-ingest (master.m3u8 exists in library): restore processing_status = 'ready'
+        - If fresh ingest (master.m3u8 does not exist): delete placeholder media_streams and unpublished shells
+        """
+        target_id = job.episode_id or job.media_id or job.job_id
+        output_dir = Path(settings.MEDIA_LIBRARY_DIR) / str(target_id)
+        master_pl = output_dir / "master.m3u8"
+        is_reingest = master_pl.exists()
+
+        match_col = "episode_id" if job.episode_id else "media_id"
+        match_val = job.episode_id or job.media_id
+
+        if is_reingest:
+            if match_val:
+                await db.update("media_streams", match_col, match_val, {"processing_status": "ready"})
+            logger.info(f"Restored re-ingest job {job.job_id} ({job.title}) to 'ready' status as master.m3u8 exists.")
+        else:
+            if match_val:
+                try:
+                    await db.delete("media_streams", match_col, match_val)
+                except Exception as e:
+                    logger.warning(f"Could not delete media_streams for cancelled job {job.job_id}: {e}")
+
+                if job.episode_id:
+                    try:
+                        ep_rows = await db.select("episodes", {"id": f"eq.{job.episode_id}", "is_published": "eq.false"})
+                        if ep_rows:
+                            await db.delete("episodes", "id", job.episode_id)
+                    except Exception as e:
+                        logger.warning(f"Could not clean up episode {job.episode_id}: {e}")
+                elif job.media_id:
+                    try:
+                        m_rows = await db.select("media_items", {"id": f"eq.{job.media_id}", "is_published": "eq.false"})
+                        if m_rows:
+                            await db.delete("media_items", "id", job.media_id)
+                    except Exception as e:
+                        logger.warning(f"Could not clean up media_item {job.media_id}: {e}")
+            logger.info(f"Cleaned up placeholder records for unstarted job {job.job_id} ({job.title}).")
 
     async def _process_queue_loop(self):
         while True:

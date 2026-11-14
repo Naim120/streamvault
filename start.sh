@@ -287,7 +287,9 @@ echo "==========================================================="
 echo "  Starting StreamVault (Mode: ${MODE^^})                   "
 echo "==========================================================="
 
-mkdir -p "$DIR/media/incoming" "$DIR/media/library" "$DIR/media/temp" "$DIR/.nginx" "$DIR/logs" "$HOME/.aria2"
+mkdir -p "$DIR/media/incoming" "$DIR/media/library" "$DIR/media/temp"
+mkdir -p "$DIR/.nginx" "$DIR/logs" "$HOME/.aria2"
+chmod 700 "$DIR/.nginx" "$DIR/logs" "$HOME/.aria2" 2>/dev/null || true
 
 # 1. Aria2c Daemon
 if ! pgrep -x "aria2c" > /dev/null; then
@@ -297,6 +299,7 @@ if ! pgrep -x "aria2c" > /dev/null; then
   else
     ARIA2_SECRET="$ARIA2_RPC_SECRET"
   fi
+  ( umask 077 && touch "$HOME/.aria2/aria2.conf" && chmod 600 "$HOME/.aria2/aria2.conf" )
   cat << EOF > "$HOME/.aria2/aria2.conf"
 dir=${DIR}/media/incoming
 enable-rpc=true
@@ -397,10 +400,17 @@ if [ "$MODE" = "prod" ] || [ "$MODE" = "tunnel" ]; then
   SB_TOKEN="${SUPABASE_MANAGEMENT_TOKEN:-}"
   SB_REF="${SUPABASE_PROJECT_REF:-}"
   if [ -n "$SB_TOKEN" ] && [ -n "$SB_REF" ]; then
+    ALLOW_LIST="http://localhost:8080/**,http://localhost:5173/**,http://127.0.0.1:8080/**,http://${LAN_IP}:8080/**,http://${LAN_IP}/**"
+    if [ -n "$PUBLIC_DOMAIN" ]; then
+      ALLOW_LIST="${ALLOW_LIST},https://${PUBLIC_DOMAIN}/**"
+    fi
+    if [ -n "$TARGET_ORIGIN" ]; then
+      ALLOW_LIST="${ALLOW_LIST},${TARGET_ORIGIN}/**"
+    fi
     curl -s -X PATCH "https://api.supabase.com/v1/projects/${SB_REF}/config/auth" \
       -H "Authorization: Bearer ${SB_TOKEN}" \
       -H "Content-Type: application/json" \
-      -d "{\"site_url\":\"${TARGET_ORIGIN}\",\"uri_allow_list\":\"http://localhost:8080/**,http://localhost:5173/**,http://${LAN_IP}:8080/**,http://${LAN_IP}/**,http://192.168.*.*:8080/**,http://192.168.*.*/**,http://10.*.*.*:8080/**,http://10.*.*.*/**,http://172.*.*.*:8080/**,http://172.*.*.*/**,https://*.trycloudflare.com/**\"}" >/dev/null 2>&1 || true
+      -d "{\"site_url\":\"${TARGET_ORIGIN}\",\"uri_allow_list\":\"${ALLOW_LIST}\"}" >/dev/null 2>&1 || true
   fi
 
   echo ""
@@ -440,6 +450,7 @@ echo "Press Ctrl+C to terminate services (or run './start.sh stop' from another 
 cleanup() {
   echo "Terminating services..."
   kill $MEDIA_PID $ADMIN_PID ${FRONTEND_PID:-} ${TUNNEL_PID:-} 2>/dev/null || true
+  pkill -x "aria2c" 2>/dev/null || true
   if [ -f "$DIR/.nginx/nginx.pid" ]; then
     nginx -c "$DIR/nginx.conf" -s quit 2>/dev/null || true
   fi

@@ -85,3 +85,4 @@ To restart services:
 - **FastAPI Media Server (Port 8000):** Validates HMAC playback tokens, resolves resume points, coordinates transcoder workers, and powers metadata APIs.
 - **Local Admin Panel (Port 4000):** Bound to `127.0.0.1` for local management. Provides file ingestion, batch remuxing, queue inspection, telemetry KPIs, and database sync.
 - **Supabase Cloud (PostgreSQL + Auth):** Handles user authentication, watch progress sync, user favorites, and catalog metadata.
+

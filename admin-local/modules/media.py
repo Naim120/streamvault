@@ -83,13 +83,15 @@ async def proxy_delete_incoming_file(filename: str):
         if ADMIN_SECRET:
             headers["X-Admin-Secret"] = ADMIN_SECRET
         async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.delete(f"http://localhost:8000/api/metadata/incoming-file/{filename}", headers=headers)
+            resp = await client.delete(f"{MEDIA_SERVER_URL}/api/metadata/incoming-file/{filename}", headers=headers)
             return JSONResponse(status_code=resp.status_code, content=resp.json())
     except Exception as e:
         from pathlib import Path
+        if Path(filename).is_absolute() or ".." in Path(filename).parts:
+            raise HTTPException(status_code=403, detail="Invalid file path")
         incoming = Path(settings.MEDIA_INCOMING_DIR).resolve()
         target = (incoming / filename).resolve()
-        if not str(target).startswith(str(incoming)):
+        if target.is_symlink() or not target.is_relative_to(incoming):
             raise HTTPException(status_code=403, detail="Invalid file path")
         if not target.exists() or not target.is_file():
             raise HTTPException(status_code=404, detail="File not found")
@@ -154,6 +156,36 @@ async def proxy_bulk_ingest(payload: Dict[str, Any]):
             raise HTTPException(status_code=502, detail=f"Failed to connect to Media Server: {e}")
 
 
+@router.delete("/api/admin/transcode/queue/{identifier:path}")
+@router.delete("/api/system/transcode/queue/{identifier:path}")
+async def proxy_cancel_queued_transcode(identifier: str):
+    """Proxy route to Media Server to cancel an individual queued transcode job"""
+    url = f"{MEDIA_SERVER_URL}/api/system/transcode/queue/{identifier}"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.delete(url, headers={"X-Admin-Secret": ADMIN_SECRET})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to connect to Media Server: {e}")
+
+
+@router.post("/api/admin/transcode/queue/clear")
+@router.post("/api/system/transcode/queue/clear")
+async def proxy_clear_queued_transcodes():
+    """Proxy route to Media Server to cancel and clear all waiting queued transcode jobs"""
+    url = f"{MEDIA_SERVER_URL}/api/system/transcode/queue/clear"
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        try:
+            resp = await client.post(url, headers={"X-Admin-Secret": ADMIN_SECRET})
+            if resp.status_code >= 400:
+                raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            return resp.json()
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=502, detail=f"Failed to connect to Media Server: {e}")
+
+
 
 
 MEDIA_HTML = r"""      <!-- TAB 3: MEDIA INGESTION & TRANSCODING QUEUE -->
@@ -194,6 +226,10 @@ MEDIA_HTML = r"""      <!-- TAB 3: MEDIA INGESTION & TRANSCODING QUEUE -->
                 <button type="button" id="tab-btn-all" onclick="setIncomingTab('all')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition flex items-center gap-1.5 border border-transparent cursor-pointer">
                   <span>📁 All Incoming Files</span>
                   <span id="badge-all-count" class="px-1.5 py-0.2 rounded-full bg-neutral-800 text-neutral-300 text-[10px] font-mono font-bold">0</span>
+                </button>
+                <button type="button" id="tab-btn-queue" onclick="setIncomingTab('queue')" class="px-3.5 py-1.5 rounded-lg text-xs font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition flex items-center gap-1.5 border border-transparent cursor-pointer">
+                  <span>🕒 Ingest Queue</span>
+                  <span id="badge-queue-count" class="px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-mono font-bold">0</span>
                 </button>
               </div>
               <div class="flex items-center gap-2">
@@ -308,7 +344,7 @@ MEDIA_HTML = r"""      <!-- TAB 3: MEDIA INGESTION & TRANSCODING QUEUE -->
                     <p id="queue-status-sub" class="text-[10px] text-neutral-400">Sequential processor</p>
                   </div>
                 </div>
-                <span id="queue-badge" class="px-2.5 py-1 bg-neutral-800 text-neutral-400 rounded-lg text-[10px] font-mono font-bold">0 in queue</span>
+                <button type="button" id="queue-badge" onclick="setIncomingTab('queue')" class="px-2.5 py-1 bg-neutral-800 text-neutral-400 hover:text-white hover:bg-neutral-700 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition">0 in queue</button>
               </div>
 
               <!-- Animated Progress Bar Container -->
@@ -329,6 +365,18 @@ MEDIA_HTML = r"""      <!-- TAB 3: MEDIA INGESTION & TRANSCODING QUEUE -->
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
                   <span>✕ Cancel Active Job</span>
                 </button>
+              </div>
+
+              <!-- Compact Queue Preview (up to 3 waiting jobs with individual cancel buttons) -->
+              <div id="sidebar-queue-preview" class="hidden pt-2 border-t border-neutral-800/80 space-y-2">
+                <div class="flex items-center justify-between text-[11px] font-bold text-neutral-400">
+                  <span class="flex items-center gap-1.5">
+                    <span>Waiting Queue</span>
+                    <span id="sidebar-queue-count" class="px-1.5 py-0.2 rounded-full bg-neutral-800 text-neutral-300 text-[10px] font-mono">0</span>
+                  </span>
+                  <button type="button" onclick="setIncomingTab('queue')" class="text-[10px] text-red-400 hover:text-red-300 transition cursor-pointer">View All →</button>
+                </div>
+                <div id="sidebar-queue-list" class="space-y-1.5"></div>
               </div>
             </div>
 
@@ -1279,13 +1327,13 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
       selectedIncoming.clear();
       currentIncomingTab = tab;
       incomingCurrentPage = 1;
-      ['pending', 'published', 'all'].forEach(t => {
+      ['pending', 'published', 'all', 'queue'].forEach(t => {
         const btn = document.getElementById(`tab-btn-${t}`);
         if (!btn) return;
         if (t === tab) {
-          btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 bg-red-600/20 text-red-400 border border-red-500/40';
+          btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-bold transition flex items-center gap-1.5 bg-red-600/20 text-red-400 border border-red-500/40 cursor-pointer';
         } else {
-          btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition flex items-center gap-1.5 border border-transparent';
+          btn.className = 'px-3.5 py-1.5 rounded-lg text-xs font-semibold text-neutral-400 hover:text-white hover:bg-neutral-800 transition flex items-center gap-1.5 border border-transparent cursor-pointer';
         }
       });
       renderIncomingFiles();
@@ -1338,13 +1386,22 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
 
       const isBusy = !!(data.is_busy && data.active_job);
       const qLen = data.queue_length || 0;
+      const totalJobs = qLen + (isBusy ? 1 : 0);
+
+      // Update Tab 4 count badge
+      const bqCount = document.getElementById('badge-queue-count');
+      if (bqCount) {
+        bqCount.innerText = totalJobs;
+        bqCount.className = totalJobs > 0
+          ? 'px-1.5 py-0.2 rounded-full bg-amber-500 text-black text-[10px] font-mono font-black animate-pulse'
+          : 'px-1.5 py-0.2 rounded-full bg-amber-500/20 text-amber-300 border border-amber-500/40 text-[10px] font-mono font-bold';
+      }
 
       if (badgeEl) {
-        const totalJobs = qLen + (isBusy ? 1 : 0);
         badgeEl.innerText = `${totalJobs} job${totalJobs === 1 ? '' : 's'} in queue`;
         badgeEl.className = totalJobs > 0 
-          ? 'px-2.5 py-1 bg-red-600/20 text-red-400 border border-red-500/40 rounded-lg text-[10px] font-mono font-bold'
-          : 'px-2.5 py-1 bg-neutral-800 text-neutral-400 rounded-lg text-[10px] font-mono font-bold';
+          ? 'px-2.5 py-1 bg-red-600/20 text-red-400 border border-red-500/40 rounded-lg text-[10px] font-mono font-bold cursor-pointer hover:bg-red-600 hover:text-white transition'
+          : 'px-2.5 py-1 bg-neutral-800 text-neutral-400 rounded-lg text-[10px] font-mono font-bold cursor-pointer hover:bg-neutral-700 transition';
       }
 
       if (isBusy) {
@@ -1377,6 +1434,41 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
           loadCatalog();
         }
       }
+
+      // Update right sidebar compact preview of waiting jobs
+      const sbPreview = document.getElementById('sidebar-queue-preview');
+      const sbCount = document.getElementById('sidebar-queue-count');
+      const sbList = document.getElementById('sidebar-queue-list');
+      if (sbPreview && sbList) {
+        const waitingJobs = data.queued_jobs || [];
+        if (waitingJobs.length > 0) {
+          sbPreview.classList.remove('hidden');
+          if (sbCount) sbCount.innerText = waitingJobs.length;
+          const top3 = waitingJobs.slice(0, 3);
+          sbList.innerHTML = top3.map((q, idx) => `
+            <div class="flex items-center justify-between gap-2 p-1.5 bg-neutral-900/90 border border-neutral-800 rounded-lg text-xs">
+              <div class="min-w-0 flex-1">
+                <div class="flex items-center gap-1.5">
+                  <span class="text-[10px] font-mono text-amber-400 font-bold">#${idx + 1}</span>
+                  <span class="text-white font-semibold truncate text-[11px]">${escapeHtml(q.title || q.filename)}</span>
+                </div>
+                <p class="text-[10px] text-neutral-500 font-mono truncate">${escapeHtml(q.filename)}</p>
+              </div>
+              <button type="button" data-identifier="${escapeHtml(q.job_id || q.filename)}" onclick="cancelQueuedTranscodeJob(this.dataset.identifier, this)" title="Cancel this queued job" class="px-1.5 py-0.5 text-neutral-400 hover:text-red-400 hover:bg-red-500/10 rounded transition text-[11px] font-bold cursor-pointer">
+                ✕
+              </button>
+            </div>
+          `).join('');
+        } else {
+          sbPreview.classList.add('hidden');
+          sbList.innerHTML = '';
+        }
+      }
+
+      // If on the dedicated queue tab, refresh its view immediately
+      if (currentIncomingTab === 'queue') {
+        renderQueuedJobsView();
+      }
     }
 
     async function cancelActiveTranscodeJob() {
@@ -1393,7 +1485,8 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
         const data = await res.json();
         if (res.ok) {
           showAdminToast('✓ ' + (data.message || 'Transcoding job cancelled and partial segments cleaned.'), 'warning');
-          updateQueueStatus();
+          await updateQueueStatus();
+          fetchIncomingFiles();
         } else {
           showAdminToast('Failed to cancel job: ' + (data.detail || JSON.stringify(data)), 'error');
         }
@@ -1405,6 +1498,161 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
           btn.innerHTML = '<svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg><span>✕ Cancel Active Job</span>';
         }
       }
+    }
+
+    async function cancelQueuedTranscodeJob(identifier, btn) {
+      if (btn) setButtonProcessing(btn, true, '⏳ Cancelling...');
+      try {
+        const res = await fetch(`/api/admin/transcode/queue/${encodeURIComponent(identifier)}`, {
+          method: 'DELETE'
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          showAdminToast('✓ ' + (data.message || 'Queued job cancelled.'), 'warning');
+          await updateQueueStatus();
+          fetchIncomingFiles();
+        } else {
+          showAdminToast('Failed to cancel queued job: ' + (data.detail || JSON.stringify(data)), 'error');
+        }
+      } catch (err) {
+        showAdminToast('Error cancelling queued job: ' + err.message, 'error');
+      } finally {
+        if (btn) setButtonProcessing(btn, false);
+      }
+    }
+
+    async function cancelAllQueuedTranscodeJobs(btn) {
+      if (!confirm('Are you sure you want to cancel all waiting queued transcode jobs?')) return;
+      if (btn) setButtonProcessing(btn, true, '⏳ Cancelling all...');
+      try {
+        const res = await fetch('/api/admin/transcode/queue/clear', {
+          method: 'POST'
+        });
+        const data = await res.json().catch(() => ({}));
+        if (res.ok) {
+          showAdminToast('✓ ' + (data.message || 'All waiting jobs cleared from queue.'), 'warning');
+          await updateQueueStatus();
+          fetchIncomingFiles();
+        } else {
+          showAdminToast('Failed to clear queue: ' + (data.detail || JSON.stringify(data)), 'error');
+        }
+      } catch (err) {
+        showAdminToast('Error clearing queue: ' + err.message, 'error');
+      } finally {
+        if (btn) setButtonProcessing(btn, false);
+      }
+    }
+
+    function renderQueuedJobsView() {
+      const cont = document.getElementById('incoming-files-list');
+      const bulkBar = document.getElementById('contextual-bulk-bar');
+      const pagFooter = document.getElementById('incoming-pagination-footer');
+      if (bulkBar) bulkBar.classList.add('hidden');
+      if (pagFooter) pagFooter.classList.add('hidden');
+
+      if (!cont) return;
+
+      const activeJob = window.currentActiveJob;
+      const queuedJobs = window.currentQueuedJobs || [];
+
+      if (!activeJob && queuedJobs.length === 0) {
+        cont.innerHTML = `
+          <div class="bg-neutral-900/60 border border-neutral-800 rounded-xl p-8 text-center space-y-2">
+            <div class="w-10 h-10 mx-auto rounded-full bg-neutral-800 text-neutral-400 flex items-center justify-center font-bold text-lg">🕒</div>
+            <h5 class="text-white font-bold text-sm">Queue is currently empty</h5>
+            <p class="text-neutral-400 text-xs">No active or waiting transcode jobs. Select files from the <button type="button" onclick="setIncomingTab('pending')" class="text-red-400 underline font-semibold cursor-pointer">Pending Ingest</button> or <button type="button" onclick="setIncomingTab('published')" class="text-red-400 underline font-semibold cursor-pointer">Published in Library</button> tabs to queue jobs.</p>
+          </div>
+        `;
+        return;
+      }
+
+      let html = `
+        <div class="flex items-center justify-between pb-1 text-xs">
+          <span class="text-neutral-400 font-medium">
+            ${activeJob ? '1 active job' : '0 active'} • ${queuedJobs.length} waiting in queue
+          </span>
+          ${queuedJobs.length > 0 ? `
+            <button type="button" onclick="cancelAllQueuedTranscodeJobs(this)" class="px-3 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-300 hover:text-white border border-red-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow">
+              <span>🗑️ Cancel All Waiting (${queuedJobs.length})</span>
+            </button>
+          ` : ''}
+        </div>
+      `;
+
+      // Active Job Card
+      if (activeJob) {
+        const pct = Math.max(0, Math.min(100, Math.round(activeJob.progress_pct || 0)));
+        html += `
+          <div class="bg-gradient-to-r from-amber-950/30 to-neutral-900 border border-amber-500/60 rounded-xl p-4 space-y-3 ring-1 ring-amber-500/30 shadow-lg">
+            <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+              <div class="flex items-center gap-2">
+                <span class="px-2 py-0.5 rounded text-[10px] font-black uppercase tracking-wider bg-amber-500 text-black flex items-center gap-1 animate-pulse">
+                  <span>⚡</span> <span>ACTIVE NOW</span>
+                </span>
+                <h4 class="text-sm font-bold text-white truncate max-w-md">${escapeHtml(activeJob.title)}</h4>
+              </div>
+              <button type="button" onclick="cancelActiveTranscodeJob()" class="self-start sm:self-auto px-3 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-300 hover:text-white border border-red-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow">
+                <span>✕ Cancel Active Job</span>
+              </button>
+            </div>
+            <div class="text-xs text-neutral-400 flex items-center gap-3 font-mono text-[11px] flex-wrap">
+              <span>File: <span class="text-neutral-200">${escapeHtml(activeJob.filename)}</span></span>
+              ${activeJob.media_type ? `<span class="bg-neutral-800 px-1.5 py-0.5 rounded uppercase text-[10px]">${escapeHtml(activeJob.media_type)}</span>` : ''}
+            </div>
+            <div class="space-y-1.5">
+              <div class="flex items-center justify-between text-xs font-mono">
+                <span class="text-neutral-400 text-[11px]">${escapeHtml(activeJob.stage || 'Transcoding segments...')}</span>
+                <span class="text-amber-400 font-extrabold text-xs">${pct}%</span>
+              </div>
+              <div class="w-full h-2 bg-black rounded-full overflow-hidden border border-neutral-800">
+                <div class="h-full bg-gradient-to-r from-amber-500 to-emerald-500 transition-all duration-300" style="width: ${pct}%"></div>
+              </div>
+            </div>
+          </div>
+        `;
+      }
+
+      // Waiting Queued Job Cards
+      if (queuedJobs.length > 0) {
+        html += `
+          <div class="space-y-2.5 pt-1">
+            <h5 class="text-xs font-bold text-neutral-400 uppercase tracking-wider">Waiting Queue (${queuedJobs.length})</h5>
+        `;
+
+        queuedJobs.forEach((q, idx) => {
+          const qId = escapeHtml(q.job_id || q.filename);
+          html += `
+            <div class="bg-neutral-900 border border-neutral-800 hover:border-neutral-700 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 transition">
+              <div class="flex items-start sm:items-center gap-3 min-w-0">
+                <div class="w-8 h-8 rounded-lg bg-neutral-800 border border-neutral-700 flex items-center justify-center font-mono font-bold text-xs text-amber-400 flex-shrink-0">
+                  #${idx + 1}
+                </div>
+                <div class="space-y-1 min-w-0">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span class="font-bold text-white text-xs truncate">${escapeHtml(q.title || q.filename)}</span>
+                    <span class="px-2 py-0.5 rounded text-[10px] font-semibold bg-amber-500/10 text-amber-300 border border-amber-500/30">
+                      Waiting for processor...
+                    </span>
+                    ${q.media_type ? `<span class="bg-neutral-800 text-neutral-400 font-mono text-[10px] px-1.5 py-0.5 rounded uppercase">${escapeHtml(q.media_type)}</span>` : ''}
+                  </div>
+                  <div class="flex items-center gap-3 text-[11px] text-neutral-400 font-mono">
+                    <span class="truncate">${escapeHtml(q.filename)}</span>
+                    ${q.audio_count !== undefined ? `<span class="text-neutral-500">• ${q.audio_count} audio</span>` : ''}
+                    ${q.sub_count !== undefined ? `<span class="text-neutral-500">• ${q.sub_count} subs</span>` : ''}
+                  </div>
+                </div>
+              </div>
+              <button type="button" data-identifier="${escapeHtml(qId)}" onclick="cancelQueuedTranscodeJob(this.dataset.identifier, this)" class="self-end sm:self-auto px-3 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-300 hover:text-white border border-red-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1.5 cursor-pointer shadow">
+                <span>✕ Cancel Queued</span>
+              </button>
+            </div>
+          `;
+        });
+
+        html += `</div>`;
+      }
+
+      cont.innerHTML = html;
     }
 
     async function updateQueueStatus() {
@@ -1433,6 +1681,15 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
     }
 
     function renderIncomingFiles() {
+      // If currently on the dedicated queue tab, render the queue dashboard view
+      if (currentIncomingTab === 'queue') {
+        renderQueuedJobsView();
+        return;
+      }
+
+      const pagFooter = document.getElementById('incoming-pagination-footer');
+      if (pagFooter) pagFooter.classList.remove('hidden');
+
       const cont = document.getElementById('incoming-files-list');
       if (!cont) return;
 
@@ -1566,9 +1823,14 @@ MEDIA_INGEST_JS = r"""    async function deleteIncomingFile(filename, sizeMb, is
           `;
         } else if (isQueued) {
           actionButtonHtml = `
-            <button id="btn-ingest-${safeId}" disabled class="single-ingest-btn px-3.5 py-1.5 bg-neutral-800 text-amber-400 border border-neutral-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-not-allowed">
-              <span>🕒 Queued...</span>
-            </button>
+            <div class="flex items-center gap-1.5">
+              <button id="btn-ingest-${safeId}" disabled class="single-ingest-btn px-3 py-1.5 bg-neutral-800 text-amber-400 border border-neutral-700 rounded-lg text-xs font-bold flex items-center gap-1.5 cursor-not-allowed">
+                <span>🕒 Queued...</span>
+              </button>
+              <button type="button" data-identifier="${escapeHtml(f.filename)}" onclick="cancelQueuedTranscodeJob(this.dataset.identifier, this)" class="px-2.5 py-1.5 bg-red-600/20 hover:bg-red-600 text-red-300 hover:text-white border border-red-500/40 rounded-lg text-xs font-bold transition flex items-center gap-1 cursor-pointer shadow">
+                <span>✕ Cancel Queue</span>
+              </button>
+            </div>
           `;
         } else {
           actionButtonHtml = `

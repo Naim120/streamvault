@@ -18,11 +18,15 @@ cloudflared
 .bin/
 
 # 3. Python Virtualenvs & Caches
+venv
 venv/
+.venv
 .venv/
 env/
 ENV/
+backend/venv
 backend/venv/
+backend/.venv
 backend/.venv/
 __pycache__/
 *.py[cod]
@@ -60,7 +64,7 @@ media/temp/*
 # Catch-all for media extensions anywhere
 *.mkv
 *.mp4
-*.ts
+media/**/*.ts
 *.m4s
 *.m3u8
 *.vtt
@@ -71,6 +75,7 @@ media/temp/*
 *.avi
 *.mov
 downloads/
+!frontend/**/*.ts
 
 # 6. Runtime Logs & State
 logs/*

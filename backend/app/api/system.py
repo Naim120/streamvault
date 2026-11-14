@@ -4,6 +4,7 @@ import math
 import os
 import psutil
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone, timedelta
@@ -24,6 +25,19 @@ _dashboard_summary_cache: Dict[str, Any] = {
     "timestamp": 0.0
 }
 _dashboard_summary_lock = asyncio.Lock()
+
+def invalidate_system_caches():
+    """
+    Clears both settings cache and dashboard summary cache so UI mutations
+    and queue events reflect immediately without stale polling bounce-backs.
+    """
+    global _cached_settings
+    _cached_settings = None
+    _dashboard_summary_cache["data"] = None
+    _dashboard_summary_cache["timestamp"] = 0.0
+    with _kpis_cache_lock:
+        _analytics_kpis_cache["data"] = None
+        _analytics_kpis_cache["timestamp"] = 0.0
 
 def _parse_env_bool(val: Optional[str]) -> Optional[bool]:
     if val is None:
@@ -219,7 +233,7 @@ async def update_settings(payload: UpdateSettingsPayload):
 
     if update_dict:
         await db.update("system_settings", "id", 1, update_dict)
-        _cached_settings = None # Invalidate cache
+        invalidate_system_caches()
 
     current_settings = await get_settings()
     return {
@@ -235,7 +249,45 @@ async def cancel_active_transcode():
     cleans up incomplete partial rendition segments, and resets status to Idle.
     """
     result = await transcode_queue.cancel_active_job()
+    invalidate_system_caches()
+    try:
+        from .metadata import invalidate_catalog_cache
+        invalidate_catalog_cache()
+    except Exception:
+        pass
     return result
+
+@router.delete("/transcode/queue/{identifier:path}", dependencies=[Depends(require_admin_secret)])
+async def cancel_queued_transcode(identifier: str):
+    """
+    Cancels an individual waiting queued transcode job before execution begins.
+    Cleans up placeholder DB records and invalidates caches.
+    """
+    res = await transcode_queue.cancel_queued_job(identifier)
+    invalidate_system_caches()
+    try:
+        from .metadata import invalidate_catalog_cache
+        invalidate_catalog_cache()
+    except Exception:
+        pass
+    if res.get("status") == "not_found":
+        raise HTTPException(status_code=404, detail=res["message"])
+    return res
+
+@router.post("/transcode/queue/clear", dependencies=[Depends(require_admin_secret)])
+async def clear_transcode_queue():
+    """
+    Cancels and clears all waiting queued transcode jobs before execution begins.
+    Cleans up placeholder DB records and invalidates caches.
+    """
+    res = await transcode_queue.cancel_all_queued_jobs()
+    invalidate_system_caches()
+    try:
+        from .metadata import invalidate_catalog_cache
+        invalidate_catalog_cache()
+    except Exception:
+        pass
+    return res
 
 @router.get("/status", dependencies=[Depends(require_admin_secret)])
 async def get_queue_status():
@@ -324,10 +376,13 @@ async def get_dashboard_summary():
 
         settings_payload = {
             "transcoding_enabled": bool(sett.get("transcoding_enabled", True)),
+            "transcode_mode": sett.get("transcode_mode", "abr_transcode" if sett.get("transcoding_enabled") else "lossless_remux"),
+            "max_transcode_threads": _safe_int(sett.get("max_transcode_threads"), 4),
             "allocated_cpu_cores": _safe_int(sett.get("allocated_cpu_cores"), 4),
             "allocated_ram_mb": _safe_int(sett.get("allocated_ram_mb"), 4096),
             "gpu_enabled": bool(sett.get("gpu_enabled", False)),
-            "cpu_thread_limit": ctl_val
+            "cpu_thread_limit": ctl_val,
+            "hw_accel_type": sett.get("hw_accel_type", "auto")
         }
 
         # 4. Platform KPIs breakdown
@@ -483,6 +538,12 @@ async def get_system_telemetry():
 
 SENSITIVE_PROFILE_FIELDS = {"password_hash", "stripe_customer_id", "stripe_subscription_id"}
 
+_analytics_kpis_cache: Dict[str, Any] = {
+    "data": None,
+    "timestamp": 0.0
+}
+_kpis_cache_lock = threading.Lock()
+
 @router.get("/analytics/users", dependencies=[Depends(require_admin_secret)])
 async def get_analytics_users(
     page: int = Query(1, ge=1),
@@ -494,30 +555,42 @@ async def get_analytics_users(
 ):
     """
     Paginated user directory with live online/watching computation and platform KPI metrics.
+    Caches aggregated KPIs for 3.0s to absorb concurrent burst polling.
     """
-    # 1. Fetch global platform KPIs
-    kpis = {
-        "total_registered_users": 0,
-        "online_now_count": 0,
-        "watching_now_count": 0,
-        "total_platform_watch_seconds": 0,
-        "total_platform_site_seconds": 0,
-        "total_login_sessions": 0,
-        "total_visits": 0
-    }
-    try:
-        rpc_kpis = await db.rpc("get_platform_telemetry_kpis")
-        if isinstance(rpc_kpis, dict):
-            kpis.update(rpc_kpis)
-    except Exception as e:
-        logger.warning(f"Could not fetch telemetry KPIs via RPC: {e}")
+    # 1. Fetch global platform KPIs (cached for 3.0s)
+    now_ts = time.time()
+    kpis = None
+    with _kpis_cache_lock:
+        if _analytics_kpis_cache["data"] is not None and (now_ts - _analytics_kpis_cache["timestamp"] < 3.0):
+            kpis = dict(_analytics_kpis_cache["data"])
 
-    try:
-        _, total_logins = await db.select_with_count("user_login_logs", {"limit": "1"})
-        kpis["total_login_sessions"] = total_logins
-        kpis["total_visits"] = total_logins
-    except Exception as e:
-        logger.warning(f"Could not count user_login_logs: {e}")
+    if kpis is None:
+        kpis = {
+            "total_registered_users": 0,
+            "online_now_count": 0,
+            "watching_now_count": 0,
+            "total_platform_watch_seconds": 0,
+            "total_platform_site_seconds": 0,
+            "total_login_sessions": 0,
+            "total_visits": 0
+        }
+        try:
+            rpc_kpis = await db.rpc("get_platform_telemetry_kpis")
+            if isinstance(rpc_kpis, dict):
+                kpis.update(rpc_kpis)
+        except Exception as e:
+            logger.warning(f"Could not fetch telemetry KPIs via RPC: {e}")
+
+        try:
+            _, total_logins = await db.select_with_count("user_login_logs", {"limit": "1"})
+            kpis["total_login_sessions"] = total_logins
+            kpis["total_visits"] = total_logins
+        except Exception as e:
+            logger.warning(f"Could not count user_login_logs: {e}")
+
+        with _kpis_cache_lock:
+            _analytics_kpis_cache["data"] = dict(kpis)
+            _analytics_kpis_cache["timestamp"] = time.time()
 
     # 2. Build PostgREST parameters for profiles
     allowed_sorts = {

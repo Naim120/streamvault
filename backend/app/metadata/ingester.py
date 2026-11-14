@@ -1,10 +1,13 @@
 import logging
 import re
 import uuid
+from pathlib import Path
 from typing import Any, Dict, List, Optional
+from fastapi import HTTPException
 from .tmdb import tmdb_client, TMDB_IMAGE_BASE
 from .omdb import omdb_client
 from ..database import db
+from ..config import settings
 from ..transcoder.worker import transcode_queue, TranscodeJob
 from ..transcoder.pipeline_remux import sanitize_track_label
 from ..transcoder.probe import probe_file
@@ -245,20 +248,36 @@ class MediaIngester:
 
         formatted_subs = None
         if subtitle_tracks_config is not None:
-            formatted_subs = [
-                {
+            incoming_root = Path(settings.MEDIA_INCOMING_DIR).resolve()
+            target_id = episode_id or media_id
+            subs_root = (Path(settings.MEDIA_LIBRARY_DIR).resolve() / str(target_id) / "subs").resolve() if target_id else None
+            allowed_roots = [incoming_root, *([subs_root] if subs_root else [])]
+
+            formatted_subs = []
+            for idx, cfg in enumerate(subtitle_tracks_config):
+                if not ((cfg.get("label") or cfg.get("lang") or cfg.get("raw_stream_idx") is not None) and str(cfg.get("label", "")).lower() != "none"):
+                    continue
+                raw_ext_id = cfg.get("ext_id")
+                if raw_ext_id is not None and not re.fullmatch(r"[\w\-]+", str(raw_ext_id)):
+                    raise HTTPException(status_code=400, detail="Invalid subtitle ext_id")
+                raw_path = cfg.get("path")
+                canonical_path = None
+                if raw_path is not None and str(raw_path).strip():
+                    p = Path(str(raw_path))
+                    resolved_p = p.resolve()
+                    if p.is_symlink() or not any(resolved_p.is_relative_to(r) for r in allowed_roots) or not resolved_p.is_file():
+                        raise HTTPException(status_code=403, detail="Subtitle path outside allowed directories")
+                    canonical_path = str(resolved_p)
+                formatted_subs.append({
                     "index": idx,
                     "raw_stream_idx": cfg.get("raw_stream_idx"),
                     "lang": (cfg.get("lang") or "en")[:12],
                     "label": sanitize_track_label(cfg.get("label"), fallback=f"Subtitle {idx + 1}"),
                     "format": "vtt",
                     "is_external": bool(cfg.get("is_external", False)),
-                    "path": cfg.get("path"),
-                    "ext_id": cfg.get("ext_id")
-                }
-                for idx, cfg in enumerate(subtitle_tracks_config)
-                if (cfg.get("label") or cfg.get("lang") or cfg.get("raw_stream_idx") is not None) and str(cfg.get("label", "")).lower() != "none"
-            ]
+                    "path": canonical_path,
+                    "ext_id": str(raw_ext_id) if raw_ext_id is not None else None,
+                })
         elif subtitle_languages:
             formatted_subs = [
                 {
@@ -301,9 +320,15 @@ class MediaIngester:
             title=f"{title}" + (f" S{season_number}E{episode_number}" if episode_id else ""),
             custom_audio_tracks=formatted_audio,
             custom_subtitle_tracks=formatted_subs,
-            force_video_reencode=force_video_reencode
+            force_video_reencode=force_video_reencode,
+            media_type="series" if episode_id else "movie"
         )
         await transcode_queue.enqueue(job)
+        try:
+            from ..api.system import invalidate_system_caches
+            invalidate_system_caches()
+        except Exception:
+            pass
 
         return {
             "media_id": media_id,

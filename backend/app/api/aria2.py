@@ -2,16 +2,19 @@ import asyncio
 import base64
 import ipaddress
 import logging
+import os
 from pathlib import Path
+import secrets
 import socket
 import subprocess
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from ..aria2.client import aria2_client
 from ..aria2.monitor import aria2_monitor
+from ..config import settings
 from ..security import require_admin_secret
 
 logger = logging.getLogger(__name__)
@@ -39,35 +42,115 @@ def raise_structured_aria2_error(
     )
 
 
+CGNAT_NET = ipaddress.ip_network("100.64.0.0/10")
+METADATA_IPS = {"169.254.169.254", "fd00:ec2::254"}
+
+
+def _validate_host_ips(hostname: str):
+    """
+    Resolves hostname and blocks SSRF targets: non-global, CGNAT (100.64.0.0/10),
+    loopback, private, link-local, reserved, multicast, unspecified, and cloud metadata.
+    """
+    try:
+        try:
+            raw_ips = [ipaddress.ip_address(hostname)]
+        except ValueError:
+            addr_info = socket.getaddrinfo(hostname, None)
+            raw_ips = [ipaddress.ip_address(addr[4][0]) for addr in addr_info]
+
+        for ip in raw_ips:
+            check_ip = ip.ipv4_mapped if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped else ip
+            if (
+                not check_ip.is_global
+                or check_ip in CGNAT_NET
+                or check_ip.is_private
+                or check_ip.is_loopback
+                or check_ip.is_link_local
+                or check_ip.is_reserved
+                or check_ip.is_multicast
+                or check_ip.is_unspecified
+                or str(check_ip) in METADATA_IPS
+            ):
+                raise_structured_aria2_error(
+                    status_code=400,
+                    error_code="SSRF_BLOCKED",
+                    title="Blocked Internal Address",
+                    detail=f"SSRF Security Violation: Direct access to local loopback, private subnet, or cloud metadata ({check_ip}) is blocked.",
+                    suggestion="Ensure the download URL points to a public internet server and not an internal network address."
+                )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise_structured_aria2_error(
+            status_code=400,
+            error_code="DNS_RESOLUTION_FAILED",
+            title="Cannot Resolve Host",
+            detail=f"Failed to resolve DNS hostname '{hostname}': {e}",
+            suggestion="Verify that the domain name is spelled correctly and the remote server is online."
+        )
+
+
 async def ensure_aria2_daemon_running() -> bool:
     """
     Checks if the Aria2 JSON-RPC daemon is listening on port 6800.
-    If unreachable, attempts to spawn it once using the user's config before failing.
+    If unreachable, attempts to spawn it once using ~/.aria2/aria2.conf before failing.
+    Always ensures an RPC secret is active, never exposing credentials via cmdline.
     """
     for _ in range(2):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(0.6)
-        res = sock.connect_ex(("127.0.0.1", 6800))
+        res = sock.connect_ex(("127.0.0.1", settings.ARIA2_RPC_PORT))
         sock.close()
         if res == 0:
             return True
 
-        # Try to spawn daemon
+        # Try to spawn daemon securely
         try:
-            conf_path = Path.home() / ".aria2" / "aria2.conf"
-            if conf_path.exists():
-                subprocess.Popen(["aria2c", f"--conf-path={conf_path}", "-D"])
+            conf_dir = Path.home() / ".aria2"
+            conf_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                os.chmod(conf_dir, 0o700)
+            except Exception:
+                pass
+
+            conf_path = conf_dir / "aria2.conf"
+            secret = settings.ARIA2_RPC_SECRET
+            if not secret and conf_path.exists():
+                try:
+                    for line in conf_path.read_text(encoding="utf-8").splitlines():
+                        if line.strip().startswith("rpc-secret="):
+                            secret = line.strip().split("=", 1)[1].strip()
+                            break
+                except Exception:
+                    pass
+
+            if not secret:
+                secret = secrets.token_hex(24)
+
+            settings.ARIA2_RPC_SECRET = secret
+            aria2_client.secret = secret
+
+            if not conf_path.exists():
+                fd = os.open(conf_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(
+                        f"dir={settings.ARIA2_DOWNLOAD_DIR}\n"
+                        "enable-rpc=true\n"
+                        "rpc-listen-all=false\n"
+                        f"rpc-listen-port={settings.ARIA2_RPC_PORT}\n"
+                        "rpc-allow-origin-all=false\n"
+                        f"rpc-secret={secret}\n"
+                        "seed-time=0\n"
+                        "bt-stop-timeout=600\n"
+                        "follow-torrent=mem\n"
+                    )
             else:
-                subprocess.Popen([
-                    "aria2c",
-                    "--enable-rpc=true",
-                    "--rpc-listen-all=false",
-                    "--rpc-listen-port=6800",
-                    "--seed-time=0",
-                    "--bt-stop-timeout=600",
-                    "--follow-torrent=mem",
-                    "-D"
-                ])
+                try:
+                    os.chmod(conf_path, 0o600)
+                except Exception:
+                    pass
+
+            subprocess.Popen(["aria2c", f"--conf-path={conf_path}", "-D"])
             await asyncio.sleep(1.0)
         except Exception as e:
             logger.warning(f"Could not auto-spawn aria2c daemon: {e}")
@@ -101,6 +184,16 @@ def validate_download_uri(uri: Optional[str]) -> str:
                 detail="The magnet link is missing a valid BitTorrent info-hash parameter (xt=urn:btih:...).",
                 suggestion="Ensure the magnet link starts with 'magnet:?xt=urn:btih:' followed by a 40-character hex or 32-character base32 hash."
             )
+        # Validate embedded tracker or webseed URLs against SSRF
+        parsed_mag = urlparse(cleaned)
+        qs = parse_qs(parsed_mag.query)
+        for param in ("tr", "ws", "xs", "as"):
+            for val in qs.get(param, []):
+                val_clean = unquote(val).strip()
+                if val_clean.lower().startswith(("http://", "https://")):
+                    p = urlparse(val_clean)
+                    if p.hostname:
+                        _validate_host_ips(p.hostname)
         return cleaned
 
     # HTTP / HTTPS Validation
@@ -125,48 +218,80 @@ def validate_download_uri(uri: Optional[str]) -> str:
             suggestion="Double-check the URL format (e.g., https://example.com/video.mp4)."
         )
 
-    # SSRF Protection: Resolve IP addresses and block private/loopback/cloud metadata
-    try:
-        try:
-            ips = [ipaddress.ip_address(hostname)]
-        except ValueError:
-            addr_info = socket.getaddrinfo(hostname, None)
-            ips = [ipaddress.ip_address(addr[4][0]) for addr in addr_info]
-
-        for ip in ips:
-            if (
-                ip.is_private
-                or ip.is_loopback
-                or ip.is_link_local
-                or ip.is_reserved
-                or ip.is_multicast
-                or ip.is_unspecified
-                or str(ip) == "169.254.169.254"
-            ):
-                raise_structured_aria2_error(
-                    status_code=400,
-                    error_code="SSRF_BLOCKED",
-                    title="Blocked Internal Address",
-                    detail=f"SSRF Security Violation: Direct access to local loopback, private subnet, or cloud metadata ({ip}) is blocked.",
-                    suggestion="Ensure the download URL points to a public internet server and not an internal network address."
-                )
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise_structured_aria2_error(
-            status_code=400,
-            error_code="DNS_RESOLUTION_FAILED",
-            title="Cannot Resolve Host",
-            detail=f"Failed to resolve DNS hostname '{hostname}': {e}",
-            suggestion="Verify that the domain name is spelled correctly and the remote server is online."
-        )
-
+    # SSRF Protection: Resolve IP addresses and block private/loopback/cloud metadata/CGNAT
+    _validate_host_ips(hostname)
     return cleaned
+
+
+def _bdecode(data: bytes, max_depth: int = 50) -> tuple[Any, int]:
+    """
+    Decodes a single bencoded value starting at index 0.
+    Returns (decoded_value, end_index).
+    Raises ValueError on syntax or boundary errors.
+    """
+    if not data:
+        raise ValueError("Empty bencode stream")
+    if max_depth <= 0:
+        raise ValueError("Exceeded maximum recursion depth for bencode structure")
+
+    first = data[0:1]
+    if first == b"i":
+        end = data.find(b"e", 1)
+        if end == -1:
+            raise ValueError("Unterminated bencode integer")
+        int_str = data[1:end].decode("ascii", errors="strict")
+        if int_str.startswith("-0") or (int_str.startswith("0") and len(int_str) > 1):
+            raise ValueError(f"Invalid bencode integer encoding: {int_str}")
+        return int(int_str), end + 1
+    elif first == b"l":
+        items = []
+        idx = 1
+        while idx < len(data) and data[idx:idx+1] != b"e":
+            val, consumed = _bdecode(data[idx:], max_depth - 1)
+            items.append(val)
+            idx += consumed
+        if idx >= len(data) or data[idx:idx+1] != b"e":
+            raise ValueError("Unterminated bencode list")
+        return items, idx + 1
+    elif first == b"d":
+        res = {}
+        idx = 1
+        while idx < len(data) and data[idx:idx+1] != b"e":
+            k, consumed = _bdecode(data[idx:], max_depth - 1)
+            if not isinstance(k, bytes):
+                raise ValueError("Bencode dictionary keys must be byte strings")
+            idx += consumed
+            if idx >= len(data):
+                raise ValueError("Missing value for bencode dictionary key")
+            v, v_consumed = _bdecode(data[idx:], max_depth - 1)
+            res[k] = v
+            idx += v_consumed
+        if idx >= len(data) or data[idx:idx+1] != b"e":
+            raise ValueError("Unterminated bencode dictionary")
+        return res, idx + 1
+    elif first.isdigit():
+        colon = data.find(b":")
+        if colon == -1:
+            raise ValueError("Malformed bencode string length")
+        length = int(data[:colon].decode("ascii", errors="strict"))
+        if length < 0:
+            raise ValueError("Negative bencode string length")
+        start = colon + 1
+        end = start + length
+        if end > len(data):
+            raise ValueError("Bencode string exceeds buffer length")
+        return data[start:end], end
+    else:
+        raise ValueError(f"Unexpected bencode token: {first!r}")
+
+
+MAX_TORRENT_BYTES = 15 * 1024 * 1024  # 15 MB
 
 
 def validate_torrent_bytes(content: bytes, filename: str = "file.torrent") -> bytes:
     """
-    Validates uploaded .torrent file structure, size, and Bencode dictionary format.
+    Validates uploaded .torrent file structure, size, Bencode dictionary format,
+    and validates tracker/webseed URLs against SSRF.
     """
     if not filename.lower().endswith(".torrent"):
         raise_structured_aria2_error(
@@ -186,8 +311,7 @@ def validate_torrent_bytes(content: bytes, filename: str = "file.torrent") -> by
             suggestion="Download the .torrent file again and verify its file size before uploading."
         )
 
-    max_bytes = 15 * 1024 * 1024  # 15 MB
-    if len(content) > max_bytes:
+    if len(content) > MAX_TORRENT_BYTES:
         raise_structured_aria2_error(
             status_code=400,
             error_code="INVALID_TORRENT_FILE",
@@ -196,16 +320,51 @@ def validate_torrent_bytes(content: bytes, filename: str = "file.torrent") -> by
             suggestion="Standard .torrent files are typically under 500 KB. Verify the selected file."
         )
 
-    # Basic Bencode dictionary check: standard torrents start with 'd' and end with 'e'
     clean_bytes = content.strip()
-    if not clean_bytes.startswith(b"d") or not clean_bytes.endswith(b"e"):
+    try:
+        decoded, consumed = _bdecode(clean_bytes)
+        if not isinstance(decoded, dict):
+            raise ValueError("Root bencoded value must be a dictionary")
+        if consumed != len(clean_bytes):
+            raise ValueError("Trailing data after bencoded dictionary")
+    except Exception as e:
         raise_structured_aria2_error(
             status_code=400,
             error_code="INVALID_TORRENT_FILE",
             title="Corrupted Torrent Structure",
-            detail="The uploaded file is not a valid Bencoded BitTorrent dictionary.",
+            detail=f"The uploaded file is not a valid Bencoded BitTorrent dictionary: {e}",
             suggestion="Ensure the .torrent file is intact and not corrupted, truncated, or a text document."
         )
+
+    # Extract announce and webseed URLs and validate them against SSRF
+    urls_to_check: List[str] = []
+    ann = decoded.get(b"announce")
+    if isinstance(ann, bytes):
+        urls_to_check.append(ann.decode("utf-8", errors="replace"))
+
+    ann_list = decoded.get(b"announce-list")
+    if isinstance(ann_list, list):
+        for tier in ann_list:
+            if isinstance(tier, list):
+                for tracker in tier:
+                    if isinstance(tracker, bytes):
+                        urls_to_check.append(tracker.decode("utf-8", errors="replace"))
+            elif isinstance(tier, bytes):
+                urls_to_check.append(tier.decode("utf-8", errors="replace"))
+
+    for key in (b"url-list", b"httpseeds"):
+        seeds = decoded.get(key)
+        if isinstance(seeds, bytes):
+            urls_to_check.append(seeds.decode("utf-8", errors="replace"))
+        elif isinstance(seeds, list):
+            for s in seeds:
+                if isinstance(s, bytes):
+                    urls_to_check.append(s.decode("utf-8", errors="replace"))
+
+    for u in urls_to_check:
+        u_clean = u.strip()
+        if u_clean.lower().startswith(("http://", "https://")):
+            validate_download_uri(u_clean)
 
     return content
 
@@ -410,7 +569,15 @@ async def add_download(request: Request):
 
         uploaded_f = form.get("torrent_file") or form.get("file")
         if uploaded_f and hasattr(uploaded_f, "read"):
-            raw_torrent_bytes = await uploaded_f.read()
+            raw_torrent_bytes = await uploaded_f.read(MAX_TORRENT_BYTES + 1)
+            if len(raw_torrent_bytes) > MAX_TORRENT_BYTES:
+                raise_structured_aria2_error(
+                    status_code=400,
+                    error_code="INVALID_TORRENT_FILE",
+                    title="Torrent File Too Large",
+                    detail="The uploaded torrent file exceeds the maximum limit of 15 MB.",
+                    suggestion="Standard .torrent files are typically under 500 KB. Verify the selected file."
+                )
             torrent_filename = getattr(uploaded_f, "filename", "file.torrent") or "file.torrent"
 
     gid = None
@@ -511,7 +678,15 @@ async def upload_torrent_file(
             suggestion="Restart the service from your terminal using './start.sh' or 'aria2c --conf-path=~/.aria2/aria2.conf -D'."
         )
 
-    raw_bytes = await torrent_file.read()
+    raw_bytes = await torrent_file.read(MAX_TORRENT_BYTES + 1)
+    if len(raw_bytes) > MAX_TORRENT_BYTES:
+        raise_structured_aria2_error(
+            status_code=400,
+            error_code="INVALID_TORRENT_FILE",
+            title="Torrent File Too Large",
+            detail="The uploaded torrent file exceeds the maximum limit of 15 MB.",
+            suggestion="Standard .torrent files are typically under 500 KB. Verify the selected file."
+        )
     valid_bytes = validate_torrent_bytes(raw_bytes, torrent_file.filename or "file.torrent")
     try:
         gid = await aria2_client.add_torrent(valid_bytes)
@@ -661,7 +836,8 @@ async def retry_download(gid: str):
         pass
 
     if uris:
-        new_gid = await aria2_client.add_uri([uris[0]])
+        validated_uris = [validate_download_uri(u) for u in uris]
+        new_gid = await aria2_client.add_uri([validated_uris[0]])
         if binding and new_gid:
             aria2_monitor.bind_metadata(
                 gid=new_gid,

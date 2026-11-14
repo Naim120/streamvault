@@ -91,6 +91,18 @@ async def update_catalog_item(media_id: str, payload: MediaUpdatePayload):
             legacy_type = "recently_added" if "recent" in badge_val.lower() else ("new_season" if "season" in badge_val.lower() else "none")
             data["badge_type"] = legacy_type
 
+        # Update through Media Server to ensure in-memory cache invalidation & catalog version bump
+        url = f"{MEDIA_SERVER_URL}/api/metadata/{media_id}"
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            try:
+                resp = await client.put(url, headers={"X-Admin-Secret": ADMIN_SECRET}, json=data)
+                if resp.status_code == 200:
+                    return resp.json().get("item") or resp.json()
+                elif resp.status_code < 500 and resp.status_code != 404:
+                    raise HTTPException(status_code=resp.status_code, detail=resp.text)
+            except (httpx.RequestError, HTTPException) as e:
+                logger.warning(f"Media Server proxy update failed, falling back to direct db update: {e}")
+
         updated = await db.update("media_items", "id", media_id, data)
         if not updated:
             raise HTTPException(status_code=400, detail="Failed to update database record.")

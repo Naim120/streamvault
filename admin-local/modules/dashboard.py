@@ -369,7 +369,8 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
 
       // 3. Transcoding Engine Governor Mode
       if (sett) {
-        currentMode = sett.transcode_mode;
+        const isAbr = Boolean(sett.transcoding_enabled || sett.transcode_mode === 'abr_transcode');
+        currentMode = sett.transcode_mode || (isAbr ? 'abr_transcode' : 'lossless_remux');
         const badge = document.getElementById('transcode-badge');
         const btn = document.getElementById('transcode-btn');
         const desc = document.getElementById('transcode-desc');
@@ -379,7 +380,7 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
           limiter.value = sett.cpu_thread_limit;
         }
 
-        if (sett.transcode_mode === 'abr_transcode') {
+        if (currentMode === 'abr_transcode') {
           badge.innerText = 'Multi-Bitrate ABR';
           badge.className = 'px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider bg-purple-500/20 text-purple-400 border border-purple-500/30';
           btn.innerText = 'Switch to Lossless Remux';
@@ -609,12 +610,19 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
       if (btn) btn.disabled = false;
     }
 
+    let settingsMutationInFlight = false;
+    let lastSettingsMutationTs = 0;
+
     async function setTranscodeMode(mode) {
+      settingsMutationInFlight = true;
+      lastSettingsMutationTs = Date.now();
       applyOptimisticTranscodeModeUI(mode);
       const isAbr = (mode === 'abr_transcode');
       try {
         await updateLiveSettings({ transcoding_enabled: isAbr, transcode_mode: mode });
       } finally {
+        settingsMutationInFlight = false;
+        lastSettingsMutationTs = Date.now();
         restoreGovernorBadge();
       }
     }
@@ -697,6 +705,8 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
 
 
     async function updateLiveSettings(partialPayload) {
+      settingsMutationInFlight = true;
+      lastSettingsMutationTs = Date.now();
       try {
         const res = await fetch('/api/system/settings', {
           method: 'POST',
@@ -705,14 +715,20 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
         }).catch(() => null);
 
         if (res && res.ok) {
+          const data = await res.json().catch(() => ({}));
           showAdminToast('✓ Live resource limits updated', 'success');
-          fetchSystem().catch(() => {});
+          if (data && data.settings) {
+            renderSystem(null, data.settings, null, true);
+          }
         } else {
           const err = res ? await res.json().catch(() => ({})) : {};
           showAdminToast('Failed to update settings: ' + (err.detail || 'Error'), 'error');
         }
       } catch (e) {
         showAdminToast('Error updating settings: ' + e.message, 'error');
+      } finally {
+        settingsMutationInFlight = false;
+        lastSettingsMutationTs = Date.now();
       }
     }
 
@@ -799,7 +815,8 @@ DASHBOARD_JS = r"""    function renderSystem(caps, sett, stat, serverConnected =
         }).catch(() => null);
 
         if (res) {
-          renderSystem(res.capabilities, res.settings, res.queue, true);
+          const skipSettings = settingsMutationInFlight || (Date.now() - lastSettingsMutationTs < 2500);
+          renderSystem(res.capabilities, skipSettings ? null : res.settings, res.queue, true);
           renderQueueStatus(res.queue);
 
           // Update KPI metrics on Dashboard cards

@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
+from pydantic import model_validator
 from typing import List
 
 # Base workspace path
@@ -30,6 +31,9 @@ class Settings(BaseSettings):
     ADMIN_API_SECRET: str = ""
     CORS_ORIGINS: str = "http://localhost:5173,http://localhost:4000,http://127.0.0.1:5173,http://127.0.0.1:4000"
     STREAM_PUBLIC_BASE_URL: str = ""
+    PUBLIC_DOMAIN: str = ""
+    PUBLIC_SITE_URL: str = ""
+    FRONTEND_ORIGIN: str = ""
     
     # Supabase
     SUPABASE_URL: str = ""
@@ -53,10 +57,19 @@ class Settings(BaseSettings):
     ARIA2_RPC_SECRET: str = ""
     ARIA2_RPC_SSL: bool = False
     ARIA2_DOWNLOAD_DIR: str = str(BASE_DIR / "media" / "incoming")
+    ARIA2_EGRESS_PROXY: str = ""
 
     @property
     def cors_origins_list(self) -> List[str]:
         return [origin.strip() for origin in self.CORS_ORIGINS.split(",") if origin.strip()]
+
+    @model_validator(mode="after")
+    def populate_fallbacks(self):
+        if not self.ADMIN_API_SECRET:
+            self.ADMIN_API_SECRET = os.getenv("ADMIN_SECRET", "")
+        if not self.HMAC_STREAM_SECRET:
+            self.HMAC_STREAM_SECRET = os.getenv("STREAM_TOKEN_SECRET", "")
+        return self
 
     class Config:
         env_file = str(BASE_DIR / ".env")

@@ -10,11 +10,11 @@ import { useAuthStore } from '../../store/useAuthStore';
 import { useUIStore } from '../../store/useUIStore';
 import { api } from '../../lib/api';
 import { supabase } from '../../lib/supabase';
-import { AudioTrack, Episode, MediaStream, SubtitleTrack } from '../../types';
+import { AudioTrack, Episode, MediaStream, SubtitleTrack, SavedTrackPreferences } from '../../types';
 import { MediaImage } from '../common/MediaImage';
 
 import { stripHtmlTags, extractSafeTrailer } from '../../lib/security';
-import { getPrewarmedStream } from '../../lib/streamPrewarm';
+import { getPrewarmedStream, invalidatePrewarmCache } from '../../lib/streamPrewarm';
 
 interface VttCue {
   start: number;
@@ -82,6 +82,76 @@ const cleanTrackLabel = (raw?: string | null): string => {
   return stripHtmlTags(raw).trim();
 };
 
+export interface PlayerAudioTrack {
+  index: number;
+  id: number | string;
+  label: string;
+  lang: string;
+  is_default?: boolean;
+}
+
+export interface PlayerSubtitleTrack {
+  index: number;
+  id: string;
+  label: string;
+  lang: string;
+  url: string;
+}
+
+function findMatchingAudioIndex(
+  tracks: PlayerAudioTrack[],
+  prefs: SavedTrackPreferences | null | undefined
+): number {
+  if (!prefs || tracks.length === 0) return -1;
+  // Priority 1: Label + Lang match
+  if (prefs.audio_label && prefs.audio_lang) {
+    const idx = tracks.findIndex(
+      t => t.label.toLowerCase() === prefs.audio_label!.toLowerCase() &&
+           t.lang.toLowerCase() === prefs.audio_lang!.toLowerCase()
+    );
+    if (idx !== -1) return idx;
+  }
+  // Priority 2: Label match
+  if (prefs.audio_label) {
+    const idx = tracks.findIndex(
+      t => t.label.toLowerCase() === prefs.audio_label!.toLowerCase()
+    );
+    if (idx !== -1) return idx;
+  }
+  // Priority 3: Index match
+  if (prefs.audio_index !== null && prefs.audio_index !== undefined && tracks[prefs.audio_index]) {
+    return prefs.audio_index;
+  }
+  return -1;
+}
+
+function findMatchingSubtitleIndex(
+  tracks: PlayerSubtitleTrack[],
+  prefs: SavedTrackPreferences | null | undefined
+): number {
+  if (!prefs || tracks.length === 0) return -1;
+  // Priority 1: Label + Lang match
+  if (prefs.subtitle_label && prefs.subtitle_lang) {
+    const idx = tracks.findIndex(
+      t => t.label.toLowerCase() === prefs.subtitle_label!.toLowerCase() &&
+           t.lang.toLowerCase() === prefs.subtitle_lang!.toLowerCase()
+    );
+    if (idx !== -1) return idx;
+  }
+  // Priority 2: Label match
+  if (prefs.subtitle_label) {
+    const idx = tracks.findIndex(
+      t => t.label.toLowerCase() === prefs.subtitle_label!.toLowerCase()
+    );
+    if (idx !== -1) return idx;
+  }
+  // Priority 3: Index match
+  if (prefs.subtitle_index !== null && prefs.subtitle_index !== undefined && prefs.subtitle_index >= 0 && tracks[prefs.subtitle_index]) {
+    return prefs.subtitle_index;
+  }
+  return -1;
+}
+
 interface ReadyPlaybackConfig {
   targetId: string;
   manifestUrl: string;
@@ -112,6 +182,8 @@ export const VideoPlayer: React.FC = () => {
   const activeLoadedEpisodeIdRef = useRef<string | null>(null);
   const isSwitchingEpisodeRef = useRef<boolean>(false);
   const hasAppliedDefaultAudioRef = useRef<boolean>(false);
+  const hasAppliedSavedSubRef = useRef<boolean>(false);
+  const savedPrefsRef = useRef<SavedTrackPreferences | null>(null);
 
   const [playbackConfig, setPlaybackConfig] = useState<ReadyPlaybackConfig | null>(null);
   const initialSeekTimeRef = useRef<number>(initialSeekTime);
@@ -134,6 +206,8 @@ export const VideoPlayer: React.FC = () => {
   useEffect(() => {
     hasRestoredProgressRef.current = false;
     hasAppliedDefaultAudioRef.current = false;
+    hasAppliedSavedSubRef.current = false;
+    savedPrefsRef.current = null;
     setPlaybackConfig(null);
     const known = (episode?.duration_seconds && episode.duration_seconds > 0 ? episode.duration_seconds : 0) ||
       (media?.runtime_minutes && media.runtime_minutes > 0 ? media.runtime_minutes * 60 : 0) ||
@@ -188,21 +262,6 @@ export const VideoPlayer: React.FC = () => {
   // Quality rungs
   const [availableQualities, setAvailableQualities] = useState<string[]>(['Auto']);
   const [currentQuality, setCurrentQuality] = useState<string>('Auto');
-
-  interface PlayerAudioTrack {
-    index: number;
-    id: number | string;
-    label: string;
-    lang: string;
-    is_default?: boolean;
-  }
-  interface PlayerSubtitleTrack {
-    index: number;
-    id: string;
-    label: string;
-    lang: string;
-    url: string;
-  }
 
   // Track selection state (reconciled with HLS & Admin)
   const [audioTracksList, setAudioTracksList] = useState<PlayerAudioTrack[]>([]);
@@ -311,6 +370,18 @@ export const VideoPlayer: React.FC = () => {
         setSubtitleTracksList(mappedSubs);
       }
 
+      if (seekSec > 5 && tokenData?.saved_preferences) {
+        savedPrefsRef.current = tokenData.saved_preferences;
+      } else {
+        savedPrefsRef.current = null;
+        if (seekSec <= 5) {
+          setActiveSubtitleIndex(-1);
+          setPendingSubtitleIndex(-1);
+          activeCuesRef.current = [];
+          setActiveCueText('');
+        }
+      }
+
       setInitialSeekTime(seekSec);
       setCurrentTime(seekSec);
       setPlaybackConfig({
@@ -321,8 +392,9 @@ export const VideoPlayer: React.FC = () => {
     };
 
     // FAST PATH: Check pre-warm cache
-    const prewarmed = getPrewarmedStream(currentTargetId);
-    if (prewarmed && prewarmed.tokenData && prewarmed.tokenData.expires * 1000 > Date.now() + 60000) {
+    const expectedUserId = user?.id || 'anonymous';
+    const prewarmed = getPrewarmedStream(currentTargetId, user?.id);
+    if (prewarmed && prewarmed.tokenData && prewarmed.tokenData.user_id === expectedUserId && prewarmed.tokenData.expires * 1000 > Date.now() + 60000) {
       if (media.type === 'series' && !episode && prewarmed.tokenData.resolved_episode) {
         const resumeSec = (startSeconds && startSeconds > 0)
           ? startSeconds
@@ -433,6 +505,60 @@ export const VideoPlayer: React.FC = () => {
       setSubtitleTracksList(mappedSubs);
     }
   }, [playbackConfig?.targetId, streamInfo?.subtitle_tracks]);
+
+  // 1c. Reconcile saved or default subtitle track when subtitleTracksList is available
+  useEffect(() => {
+    if (!playbackConfig?.targetId || subtitleTracksList.length === 0) return;
+    if (hasAppliedSavedSubRef.current) return;
+
+    hasAppliedSavedSubRef.current = true;
+    const prefs = savedPrefsRef.current;
+
+    // Convention: subtitle_index === -1 means user explicitly turned subtitles off
+    if (prefs?.subtitle_index === -1) {
+      setActiveSubtitleIndex(-1);
+      setPendingSubtitleIndex(-1);
+      activeCuesRef.current = [];
+      setActiveCueText('');
+      return;
+    }
+
+    if (prefs && (prefs.subtitle_label || (prefs.subtitle_index !== null && prefs.subtitle_index !== undefined && prefs.subtitle_index >= 0))) {
+      const matchedIdx = findMatchingSubtitleIndex(subtitleTracksList, prefs);
+      if (matchedIdx >= 0) {
+        const sub = subtitleTracksList[matchedIdx];
+        setActiveSubtitleIndex(matchedIdx);
+        setPendingSubtitleIndex(matchedIdx);
+        if (sub && sub.url) {
+          if (vttCacheRef.current[sub.url]) {
+            activeCuesRef.current = vttCacheRef.current[sub.url];
+            const cur = videoRef.current ? videoRef.current.currentTime : 0;
+            const matched = activeCuesRef.current.find(c => cur >= c.start && cur <= c.end);
+            if (matched) setActiveCueText(matched.text);
+          } else {
+            fetch(sub.url)
+              .then(res => res.text())
+              .then(text => {
+                const parsed = parseWebVTT(text);
+                vttCacheRef.current[sub.url] = parsed;
+                activeCuesRef.current = parsed;
+                const cur = videoRef.current ? videoRef.current.currentTime : 0;
+                const matched = parsed.find(c => cur >= c.start && cur <= c.end);
+                if (matched) setActiveCueText(matched.text);
+              })
+              .catch(err => console.warn('Failed to pre-fetch saved subtitle VTT:', err));
+          }
+        }
+        return;
+      }
+    }
+
+    // Default: Subtitles Off (-1) if no saved preference or on completion reset
+    setActiveSubtitleIndex(-1);
+    setPendingSubtitleIndex(-1);
+    activeCuesRef.current = [];
+    setActiveCueText('');
+  }, [subtitleTracksList, playbackConfig?.targetId]);
 
   // Accurate, Real-Time Buffered Progress Bar
   const updateBufferedProgress = useCallback(() => {
@@ -562,11 +688,14 @@ export const VideoPlayer: React.FC = () => {
         // Only lock hasAppliedDefaultAudioRef.current = true once streamTracks.length > 0 (or when t.default === true in master.m3u8),
         // so if streamInfo arrives after MANIFEST_PARSED, the useEffect([streamInfo]) hook still switches hls.audioTrack to the is_default track!
         const hasDefInHls = mapped.some(t => t.is_default);
-        const shouldLock = streamTracks.length > 0 || hasDefInHls;
+        const shouldLock = streamTracks.length > 0 || hasDefInHls || Boolean(savedPrefsRef.current);
 
         if (!hasAppliedDefaultAudioRef.current) {
-          const preferredIdx = mapped.findIndex(t => t.is_default);
-          const targetIdx = preferredIdx !== -1 ? preferredIdx : (hls.audioTrack >= 0 ? hls.audioTrack : 0);
+          let targetIdx = findMatchingAudioIndex(mapped, savedPrefsRef.current);
+          if (targetIdx === -1) {
+            const preferredIdx = mapped.findIndex(t => t.is_default);
+            targetIdx = preferredIdx !== -1 ? preferredIdx : (hls.audioTrack >= 0 ? hls.audioTrack : 0);
+          }
           if (shouldLock) {
             hasAppliedDefaultAudioRef.current = true;
           }
@@ -740,8 +869,11 @@ export const VideoPlayer: React.FC = () => {
       setAudioTracksList(mapped);
 
       if (!hasAppliedDefaultAudioRef.current) {
-        const preferredIdx = mapped.findIndex(t => t.is_default);
-        const targetIdx = preferredIdx !== -1 ? preferredIdx : (hls.audioTrack >= 0 ? hls.audioTrack : 0);
+        let targetIdx = findMatchingAudioIndex(mapped, savedPrefsRef.current);
+        if (targetIdx === -1) {
+          const preferredIdx = mapped.findIndex(t => t.is_default);
+          targetIdx = preferredIdx !== -1 ? preferredIdx : (hls.audioTrack >= 0 ? hls.audioTrack : 0);
+        }
         hasAppliedDefaultAudioRef.current = true;
         if (hls.audioTrack !== targetIdx && targetIdx < hls.audioTracks.length) {
           hls.audioTrack = targetIdx;
@@ -784,6 +916,9 @@ export const VideoPlayer: React.FC = () => {
     const targetEpisodeId = media.type === 'series' ? activeLoadedEpisodeIdRef.current : null;
     if (media.type === 'series' && !targetEpisodeId) return;
 
+    const chosenAudio = audioTracksList[activeAudioIndex];
+    const chosenSub = activeSubtitleIndex >= 0 ? subtitleTracksList[activeSubtitleIndex] : null;
+
     try {
       await supabase.rpc('sync_watch_progress', {
         p_media_id: media.id,
@@ -791,12 +926,18 @@ export const VideoPlayer: React.FC = () => {
         p_season_number: episode?.season_number || null,
         p_episode_number: episode?.episode_number || null,
         p_position_seconds: pos,
-        p_duration_seconds: dur
+        p_duration_seconds: dur,
+        p_audio_index: audioTracksList.length > 0 ? activeAudioIndex : null,
+        p_audio_lang: chosenAudio?.lang || null,
+        p_audio_label: chosenAudio?.label || null,
+        p_subtitle_index: activeSubtitleIndex,
+        p_subtitle_lang: chosenSub?.lang || null,
+        p_subtitle_label: chosenSub?.label || null
       });
     } catch (e) {
       console.warn('Progress sync failed non-fatally:', e);
     }
-  }, [media, episode, user, isTrailer]);
+  }, [media, episode, user, isTrailer, activeAudioIndex, activeSubtitleIndex, audioTracksList, subtitleTracksList]);
 
   useEffect(() => {
     if (!isPlaying || isTrailer) return;
@@ -832,6 +973,11 @@ export const VideoPlayer: React.FC = () => {
     if (!isSwitchingEpisodeRef.current) {
       await syncProgress();
     }
+    if (playbackConfig?.targetId) {
+      invalidatePrewarmCache(playbackConfig.targetId);
+    } else {
+      invalidatePrewarmCache();
+    }
     queryClient.invalidateQueries({ queryKey: ['home_feed'] });
     queryClient.invalidateQueries({ queryKey: ['watch_progress'] });
     queryClient.invalidateQueries({ queryKey: ['watch_history'] });
@@ -848,6 +994,8 @@ export const VideoPlayer: React.FC = () => {
       const curPos = videoRef.current.currentTime;
       const curDur = videoRef.current.duration || 0;
       if (curPos > 3 && curDur > 0 && user && media) {
+        const chosenAudio = audioTracksList[activeAudioIndex];
+        const chosenSub = activeSubtitleIndex >= 0 ? subtitleTracksList[activeSubtitleIndex] : null;
         try {
           await supabase.rpc('sync_watch_progress', {
             p_media_id: media.id,
@@ -855,7 +1003,13 @@ export const VideoPlayer: React.FC = () => {
             p_season_number: episode?.season_number || null,
             p_episode_number: episode?.episode_number || null,
             p_position_seconds: curPos,
-            p_duration_seconds: curDur
+            p_duration_seconds: curDur,
+            p_audio_index: audioTracksList.length > 0 ? activeAudioIndex : null,
+            p_audio_lang: chosenAudio?.lang || null,
+            p_audio_label: chosenAudio?.label || null,
+            p_subtitle_index: activeSubtitleIndex,
+            p_subtitle_lang: chosenSub?.lang || null,
+            p_subtitle_label: chosenSub?.label || null
           });
         } catch (e) {
           console.warn('Pre-switch progress sync error:', e);
@@ -864,6 +1018,9 @@ export const VideoPlayer: React.FC = () => {
     }
 
     // 2. Lock switching and invalidate active loaded episode
+    if (activeLoadedEpisodeIdRef.current) {
+      invalidatePrewarmCache(activeLoadedEpisodeIdRef.current);
+    }
     isSwitchingEpisodeRef.current = true;
     activeLoadedEpisodeIdRef.current = null;
 
@@ -883,6 +1040,12 @@ export const VideoPlayer: React.FC = () => {
     setInitialSeekTime(0);
     hasRestoredProgressRef.current = false;
     hasAppliedDefaultAudioRef.current = false;
+    hasAppliedSavedSubRef.current = false;
+    savedPrefsRef.current = null;
+    setActiveSubtitleIndex(-1);
+    setPendingSubtitleIndex(-1);
+    activeCuesRef.current = [];
+    setActiveCueText('');
     setCurrentTime(0);
     const nextEpDur = (targetNextEp.duration_seconds && targetNextEp.duration_seconds > 0) ? targetNextEp.duration_seconds : 0;
     setDuration(nextEpDur);
@@ -890,14 +1053,17 @@ export const VideoPlayer: React.FC = () => {
 
     // 5. Query prewarm cache or Supabase watch_progress specifically for next episode
     let resumeTime = 0;
-    const pre = getPrewarmedStream(targetNextEp.id);
-    if (pre && pre.tokenData && pre.tokenData.resume_position_seconds !== undefined) {
+    const pre = getPrewarmedStream(targetNextEp.id, user?.id);
+    if (pre && pre.tokenData && pre.tokenData.user_id === (user?.id || 'anonymous') && pre.tokenData.resume_position_seconds !== undefined) {
       resumeTime = pre.tokenData.resume_position_seconds;
+      if (resumeTime > 5 && pre.tokenData.saved_preferences) {
+        savedPrefsRef.current = pre.tokenData.saved_preferences;
+      }
     } else if (user) {
       try {
         const { data: record } = await supabase
           .from('watch_progress')
-          .select('position_seconds, duration_seconds, is_completed')
+          .select('position_seconds, duration_seconds, is_completed, preferred_audio_index, preferred_audio_lang, preferred_audio_label, preferred_subtitle_index, preferred_subtitle_lang, preferred_subtitle_label')
           .eq('user_id', user.id)
           .eq('episode_id', targetNextEp.id)
           .maybeSingle();
@@ -910,6 +1076,16 @@ export const VideoPlayer: React.FC = () => {
           const isCompleted = record.is_completed || (dur > 0 && (record.position_seconds >= dur - 30 || record.position_seconds / dur >= 0.95));
           if (!isCompleted && record.position_seconds > 5) {
             resumeTime = record.position_seconds;
+            if (record.preferred_audio_index !== null || record.preferred_subtitle_index !== null || record.preferred_audio_label || record.preferred_subtitle_label) {
+              savedPrefsRef.current = {
+                audio_index: record.preferred_audio_index ?? null,
+                audio_lang: record.preferred_audio_lang ?? null,
+                audio_label: record.preferred_audio_label ?? null,
+                subtitle_index: record.preferred_subtitle_index ?? null,
+                subtitle_lang: record.preferred_subtitle_lang ?? null,
+                subtitle_label: record.preferred_subtitle_label ?? null,
+              };
+            }
           }
         }
       } catch (err) {
@@ -1127,6 +1303,47 @@ export const VideoPlayer: React.FC = () => {
       setActiveSubtitleIndex(-1);
       activeCuesRef.current = [];
       setActiveCueText('');
+    }
+
+    // 3. Persist chosen preferences immediately
+    const chosenAudio = audioTracksList[pendingAudioIndex];
+    const chosenSub = pendingSubtitleIndex >= 0 ? subtitleTracksList[pendingSubtitleIndex] : null;
+
+    savedPrefsRef.current = {
+      audio_index: pendingAudioIndex >= 0 ? pendingAudioIndex : null,
+      audio_lang: chosenAudio?.lang || null,
+      audio_label: chosenAudio?.label || null,
+      subtitle_index: pendingSubtitleIndex,
+      subtitle_lang: chosenSub?.lang || null,
+      subtitle_label: chosenSub?.label || null,
+    };
+
+    if (playbackConfig?.targetId) {
+      invalidatePrewarmCache(playbackConfig.targetId);
+    }
+
+    if (media && user && !isTrailer) {
+      const pos = video.currentTime;
+      const dur = video.duration || 0;
+      if (pos > 0 && dur > 0) {
+        const targetEpisodeId = media.type === 'series' ? activeLoadedEpisodeIdRef.current : null;
+        Promise.resolve(
+          supabase.rpc('sync_watch_progress', {
+            p_media_id: media.id,
+            p_episode_id: targetEpisodeId,
+            p_season_number: episode?.season_number || null,
+            p_episode_number: episode?.episode_number || null,
+            p_position_seconds: pos,
+            p_duration_seconds: dur,
+            p_audio_index: pendingAudioIndex >= 0 ? pendingAudioIndex : null,
+            p_audio_lang: chosenAudio?.lang || null,
+            p_audio_label: chosenAudio?.label || null,
+            p_subtitle_index: pendingSubtitleIndex,
+            p_subtitle_lang: chosenSub?.lang || null,
+            p_subtitle_label: chosenSub?.label || null,
+          })
+        ).catch((err: any) => console.warn('Failed to immediately save track preferences:', err));
+      }
     }
 
     setShowAudioSubModal(false);

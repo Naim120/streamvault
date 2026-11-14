@@ -76,7 +76,13 @@ class Aria2DownloadMonitor:
             logger.warning(f"No valid video file found for completed GID {gid}")
             return
 
-        logger.info(f"Download complete for GID {gid}. Largest video file: {largest_video_path} ({round(largest_size / (1024*1024), 2)} MB)")
+        incoming_root = Path(settings.MEDIA_INCOMING_DIR).resolve()
+        resolved_video_path = largest_video_path.resolve()
+        if not resolved_video_path.is_relative_to(incoming_root) or not resolved_video_path.is_file():
+            logger.warning(f"Security: Completed file {resolved_video_path} is outside incoming directory {incoming_root}")
+            return
+
+        logger.info(f"Download complete for GID {gid}. Largest video file: {resolved_video_path} ({round(largest_size / (1024*1024), 2)} MB)")
 
         # Check if metadata binding exists
         binding = self.metadata_bindings.get(gid)
@@ -90,9 +96,9 @@ class Aria2DownloadMonitor:
             season_num = binding.get("season_number")
             ep_num = binding.get("episode_number")
 
-            logger.info(f"Auto-triggering media ingestion for TMDB ID {tmdb_id} on {largest_video_path.name}")
+            logger.info(f"Auto-triggering media ingestion for TMDB ID {tmdb_id} on {resolved_video_path.name}")
             await ingester.ingest_media(
-                file_path=str(largest_video_path),
+                file_path=str(resolved_video_path),
                 tmdb_id=tmdb_id,
                 media_type=media_type,
                 season_number=season_num,

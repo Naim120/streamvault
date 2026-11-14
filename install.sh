@@ -70,7 +70,7 @@ handle_interrupt() {
   # Terminate active background child jobs
   pkill -P $$ 2>/dev/null || true
   # Clean temporary artifacts
-  rm -f /tmp/cloudflared.deb "${TARGET_DIR}/.env.tmp" "/tmp/streamvault_dist_staging" 2>/dev/null || true
+  rm -rf /tmp/cf_deb_* /tmp/cloudflared.deb "${TARGET_DIR}/.env.tmp" "/tmp/streamvault_dist_staging" 2>/dev/null || true
   rm -rf "${TARGET_DIR}/frontend/dist_staging" 2>/dev/null || true
   echo -e "${YELLOW}${BOLD}[!] Installation paused/interrupted at Step ${CURRENT_STEP}.${NC}"
   echo -e "${CYAN}Run './install.sh' anytime to resume where you left off.${NC}"
@@ -541,9 +541,12 @@ if [ "$RESUME_FROM_STEP" -le 4 ]; then
         brew install cloudflare/cloudflare/cloudflared
       elif [ "$PKG_MGR" = "apt" ]; then
         CF_DEB_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}.deb"
-        curl -fsSL "$CF_DEB_URL" -o /tmp/cloudflared.deb
-        $SUDO dpkg -i /tmp/cloudflared.deb
-        rm -f /tmp/cloudflared.deb
+        CF_TMP_DIR=$(mktemp -d /tmp/cf_deb_XXXXXX)
+        chmod 700 "$CF_TMP_DIR"
+        CF_DEB_PATH="${CF_TMP_DIR}/cloudflared.deb"
+        curl -fsSL "$CF_DEB_URL" -o "$CF_DEB_PATH"
+        $SUDO dpkg -i "$CF_DEB_PATH"
+        rm -rf "$CF_TMP_DIR"
       else
         CF_BIN_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${ARCH}"
         $SUDO curl -fsSL "$CF_BIN_URL" -o /usr/local/bin/cloudflared
@@ -664,6 +667,7 @@ if [ "$RESUME_FROM_STEP" -le 5 ]; then
     STREAM_TOKEN_SECRET="$(openssl rand -hex 32)"
     ARIA2_RPC_SECRET="$(openssl rand -hex 16)"
 
+    ( umask 077 && touch "$ENV_FILE" && chmod 600 "$ENV_FILE" )
     cat > "$ENV_FILE" <<EOF
 # --- Frontend (Vite) ---
 VITE_SUPABASE_URL=${SUPABASE_URL}
@@ -680,7 +684,9 @@ TMDB_API_KEY=${TMDB_API_KEY}
 OMDB_API_KEY=${OMDB_API_KEY}
 
 # --- Security & Streaming Secrets ---
+ADMIN_API_SECRET=${ADMIN_SECRET}
 ADMIN_SECRET=${ADMIN_SECRET}
+HMAC_STREAM_SECRET=${STREAM_TOKEN_SECRET}
 STREAM_TOKEN_SECRET=${STREAM_TOKEN_SECRET}
 ARIA2_RPC_SECRET=${ARIA2_RPC_SECRET}
 
@@ -698,6 +704,7 @@ EOF
     chmod 600 "$ENV_FILE"
     success "Created secured .env configuration."
   else
+    ( umask 077 && touch "${ENV_FILE}.tmp" && chmod 600 "${ENV_FILE}.tmp" )
     grep -vE '^(FRONTEND_ORIGIN|PUBLIC_DOMAIN|MEDIA_DIR|VITE_MEDIA_SERVER_URL|DEFAULT_ALLOCATED_CPU_CORES|DEFAULT_ALLOCATED_RAM_MB|DEFAULT_GPU_ENABLED|DEFAULT_TRANSCODING_ENABLED)=' "$ENV_FILE" > "${ENV_FILE}.tmp" || true
     cat >> "${ENV_FILE}.tmp" <<EOF
 VITE_MEDIA_SERVER_URL=
@@ -715,6 +722,7 @@ EOF
   fi
 
   if [ -d "${TARGET_DIR}/frontend" ]; then
+    ( umask 077 && touch "${TARGET_DIR}/frontend/.env" && chmod 600 "${TARGET_DIR}/frontend/.env" )
     grep -E '^VITE_' "$ENV_FILE" > "${TARGET_DIR}/frontend/.env" || true
   fi
   echo ""
@@ -789,35 +797,69 @@ if [ "$RESUME_FROM_STEP" -le 7 ]; then
 
   mkdir -p "${TARGET_DIR}/nginx"
   cat > "${TARGET_DIR}/nginx/streamvault.conf" <<EOF
+# Only trust CF-Connecting-IP when the TCP connection comes from local cloudflared (127.0.0.1/::1) AND includes a CF-Ray header
+map "\$remote_addr:\$http_cf_ray" \$trusted_cf_ip {
+    "~^(127\.0\.0\.1|::1):.+"  \$http_cf_connecting_ip;
+    default                    "";
+}
+
+map "\$remote_addr:\$http_cf_ray" \$trusted_cf_country {
+    "~^(127\.0\.0\.1|::1):.+"  \$http_cf_ipcountry;
+    default                    "";
+}
+
+map "\$remote_addr:\$http_cf_ray" \$trusted_cf_city {
+    "~^(127\.0\.0\.1|::1):.+"  \$http_cf_ipcity;
+    default                    "";
+}
+
+map "\$remote_addr:\$http_cf_ray" \$trusted_cf_ipv6 {
+    "~^(127\.0\.0\.1|::1):.+"  \$http_cf_connecting_ipv6;
+    default                    "";
+}
+
+map "\$remote_addr:\$http_cf_ray" \$trusted_cf_pseudo_ipv4 {
+    "~^(127\.0\.0\.1|::1):.+"  \$http_cf_pseudo_ipv4;
+    default                    "";
+}
+
 server {
-    listen ${NGINX_PORT:-8080};
+    listen ${NGINX_PORT:-8080} default_server;
+    listen [::]:${NGINX_PORT:-8080} default_server;
     server_name ${PUBLIC_DOMAIN:-localhost} localhost 127.0.0.1 _;
 
     root ${TARGET_DIR}/frontend/dist;
     index index.html;
 
+    server_tokens off;
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
     gzip on;
     gzip_vary on;
     gzip_min_length 1024;
-    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/vnd.apple.mpegurl text/vtt;
+    gzip_proxied any;
+    gzip_comp_level 6;
+    gzip_types
+        text/plain
+        text/css
+        text/xml
+        application/json
+        application/javascript
+        application/xml
+        application/vnd.apple.mpegurl
+        text/vtt;
 
-    client_max_body_size 20M;
+    client_max_body_size 25M;
     sendfile on;
     tcp_nopush on;
     tcp_nodelay on;
     aio threads;
 
-    location / {
-        try_files \$uri \$uri/ /index.html;
-    }
-
-    location /assets/ {
-        expires 1y;
-        add_header Cache-Control "public, immutable";
-    }
-
     # Strictly block external/public access to internal Admin, System, and Aria2 endpoints
-    location ~ ^/api/(system|aria2|admin|docs|redoc|openapi\.json) {
+    location ~ ^/api/(health|system|aria2|admin|docs|redoc|openapi\.json) {
         return 404;
     }
 
@@ -825,32 +867,80 @@ server {
     location /_internal_hls/ {
         internal;
         alias ${TARGET_DIR}/media/library/;
-        add_header Cache-Control "public, max-age=21600, s-maxage=604800, immutable";
+        add_header Cache-Control "private, no-transform, max-age=21600";
         add_header Access-Control-Allow-Origin "*";
     }
 
+    # 1. API & HLS Streaming Reverse Proxy
     location /api/ {
         proxy_pass http://127.0.0.1:8000/api/;
         proxy_http_version 1.1;
+
+        # Forward real client headers for security and rate limiting
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header CF-Connecting-IP \$http_cf_connecting_ip;
-        proxy_set_header CF-IPCountry \$http_cf_ipcountry;
+        proxy_set_header CF-Connecting-IP \$trusted_cf_ip;
+        proxy_set_header CF-IPCountry \$trusted_cf_country;
+        proxy_set_header CF-IPCity \$trusted_cf_city;
+        proxy_set_header CF-Connecting-IPv6 \$trusted_cf_ipv6;
+        proxy_set_header CF-Pseudo-IPv4 \$trusted_cf_pseudo_ipv4;
+
+        # Low-latency streaming optimizations (disable proxy buffering for HLS chunks)
         proxy_buffering off;
-        tcp_nopush on;
-        tcp_nodelay on;
+        proxy_read_timeout 600s;
+        proxy_send_timeout 600s;
     }
 
+    # 2. Direct Media Ingestion & Static Media Proxy
     location /media/ {
         proxy_pass http://127.0.0.1:8000/media/;
         proxy_http_version 1.1;
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
-        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-For \$remote_addr;
         proxy_set_header X-Forwarded-Proto \$scheme;
         proxy_buffering off;
+    }
+
+    # 3. Immutable Static Assets Caching (Vite hashed bundles: /assets/*)
+    location /assets/ {
+        expires 30d;
+        add_header Cache-Control "public, max-age=2592000, immutable";
+        add_header X-Content-Type-Options "nosniff" always;
+        try_files \$uri =404;
+    }
+
+    # Dynamic XML Sitemap with static fallback
+    location = /sitemap.xml {
+        proxy_pass http://127.0.0.1:8000/sitemap.xml;
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_intercept_errors on;
+        error_page 502 503 504 = @static_sitemap;
+    }
+
+    location @static_sitemap {
+        try_files /sitemap.xml =404;
+    }
+
+    # Robots.txt
+    location = /robots.txt {
+        try_files /robots.txt =404;
+    }
+
+    # 4. Single-Page Application (SPA) HTML fallback
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "no-cache, must-revalidate";
+        add_header X-Frame-Options "SAMEORIGIN" always;
+        add_header X-Content-Type-Options "nosniff" always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
     }
 }
 EOF

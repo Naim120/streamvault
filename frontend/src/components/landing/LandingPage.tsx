@@ -46,6 +46,8 @@ export const LandingPage: React.FC<LandingPageProps> = ({
     setAuthModalSuccessNotice,
     verifiedEmailForLogin,
     setVerifiedEmailForLogin,
+    authMode,
+    authNotice,
   } = useAuthStore();
 
   useEffect(() => {
@@ -58,6 +60,13 @@ export const LandingPage: React.FC<LandingPageProps> = ({
       setIsAuthOpen(true);
     }
   }, [authModalSuccessNotice, verifiedEmailForLogin]);
+
+  useEffect(() => {
+    if (authMode === 'forgot' && authNotice) {
+      setAuthModalMode('forgot');
+      setIsAuthOpen(true);
+    }
+  }, [authMode, authNotice]);
 
   useEffect(() => {
     updatePageSeo({
@@ -237,7 +246,11 @@ export const LandingPage: React.FC<LandingPageProps> = ({
             className="flex flex-col sm:flex-row items-center justify-center gap-3 max-w-xl mx-auto pt-4"
           >
             <input
+              id="hero-email"
+              name="email"
               type="email"
+              autoComplete="email"
+              aria-label="Email address"
               required
               value={emailInput}
               onChange={(e) => setEmailInput(e.target.value)}
@@ -493,6 +506,7 @@ export const LandingPage: React.FC<LandingPageProps> = ({
         initialEmail={emailInput}
         initialMode={authModalMode}
         titleNotice={authTitleNotice}
+        onModeChange={setAuthModalMode}
       />
     </div>
   );

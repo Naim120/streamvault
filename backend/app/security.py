@@ -6,15 +6,18 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
 from collections import defaultdict
+from pathlib import Path
 from typing import Optional
 import httpx
 from fastapi import Header, HTTPException, Request, Security
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import settings
+from .database import db
 
 logger = logging.getLogger(__name__)
 bearer_scheme = HTTPBearer(auto_error=False)
@@ -177,41 +180,85 @@ async def require_admin_secret(
     now = time.time()
     cutoff = now - 1800.0  # 30-minute window
 
-    with _auth_lock:
-        _failed_admin_auth[client_host] = [t for t in _failed_admin_auth[client_host] if t > cutoff]
-        if len(_failed_admin_auth[client_host]) >= 5:
-            raise HTTPException(
-                status_code=403,
-                detail="Locked out due to repeated failed authentication attempts"
-            )
-
-    configured_secret = getattr(settings, "ADMIN_API_SECRET", "") or os.getenv("ADMIN_API_SECRET", "")
+    configured_secret = (
+        getattr(settings, "ADMIN_API_SECRET", "")
+        or os.getenv("ADMIN_API_SECRET", "")
+        or os.getenv("ADMIN_SECRET", "")
+    ).strip()
     if not configured_secret:
         logger.error("ADMIN_API_SECRET is not configured on server")
         raise HTTPException(status_code=401, detail="Admin endpoint authentication is not configured")
+
+    with _auth_lock:
+        recent = [t for t in _failed_admin_auth[client_host] if t > cutoff]
+        if recent:
+            _failed_admin_auth[client_host] = recent
+        else:
+            _failed_admin_auth.pop(client_host, None)
+        is_locked = len(recent) >= 5
+
+    if is_locked:
+        await asyncio.sleep(0.5)
+        raise HTTPException(
+            status_code=403,
+            detail="Locked out due to repeated failed authentication attempts"
+        )
 
     # Fallback to direct header lookup if dependency injection was None
     if not x_admin_secret:
         x_admin_secret = request.headers.get("x-admin-secret") or request.headers.get("X-Admin-Secret")
 
-    if not x_admin_secret or not hmac.compare_digest(x_admin_secret.strip(), configured_secret.strip()):
-        logger.warning(f"Admin auth mismatch: client_host={client_host}, received={repr(x_admin_secret)[:15]}, expected_len={len(configured_secret)}")
+    # If authentic secret matches, reset failed attempts and allow access
+    if x_admin_secret and hmac.compare_digest(
+        x_admin_secret.strip().encode("utf-8"),
+        configured_secret.strip().encode("utf-8")
+    ):
         with _auth_lock:
-            _failed_admin_auth[client_host].append(now)
-        await asyncio.sleep(0.5)  # Tarpit brute-force scripts
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-Admin-Secret header")
+            _failed_admin_auth.pop(client_host, None)
+        return True
 
-    # Successful authentication resets failed attempts for this loopback client
+    # Otherwise, secret did NOT match or was missing:
     with _auth_lock:
-        _failed_admin_auth.pop(client_host, None)
+        _failed_admin_auth[client_host] = [t for t in _failed_admin_auth[client_host] if t > cutoff]
+        _failed_admin_auth[client_host].append(now)
+        strikes = len(_failed_admin_auth[client_host])
 
-    return True
+    logger.warning(f"Admin auth mismatch: client_host={client_host}, received={repr(x_admin_secret)[:15]}, expected_len={len(configured_secret)}, strikes={strikes}")
+
+    # Tarpit brute-force attempts uniformly before raising
+    await asyncio.sleep(0.5)
+
+    if strikes >= 5:
+        raise HTTPException(
+            status_code=403,
+            detail="Locked out due to repeated failed authentication attempts"
+        )
+
+    raise HTTPException(status_code=401, detail="Unauthorized: Invalid or missing X-Admin-Secret header")
 
 # ---------------------------------------------------------------------------
 # Cryptographic JWT Verification Cache & Core Auth Verification
 # ---------------------------------------------------------------------------
-_verified_jwt_cache: dict[str, tuple[str, float]] = {}
+_verified_jwt_cache: dict[str, tuple[str, float, Optional[float]]] = {}
+_user_revoked_before: dict[str, float] = {}
+_revoked_token_hashes: dict[str, float] = {}
 _jwt_cache_lock = threading.Lock()
+
+def revoke_user_tokens(user_id: str, token: Optional[str] = None) -> None:
+    now = time.time()
+    with _jwt_cache_lock:
+        prev = _user_revoked_before.get(str(user_id), 0.0)
+        _user_revoked_before[str(user_id)] = max(prev, now)
+        if token:
+            token_hash = hashlib.sha256(token.strip().encode("utf-8")).hexdigest()
+            _verified_jwt_cache.pop(token_hash, None)
+            _revoked_token_hashes[token_hash] = now + 86400.0
+        for k, entry in list(_verified_jwt_cache.items()):
+            if entry[0] == str(user_id):
+                _verified_jwt_cache.pop(k, None)
+        for k, exp_at in list(_revoked_token_hashes.items()):
+            if exp_at <= now:
+                _revoked_token_hashes.pop(k, None)
 
 def _decode_b64url(s: str) -> bytes:
     rem = len(s) % 4
@@ -222,7 +269,7 @@ def _decode_b64url(s: str) -> bytes:
 async def verify_supabase_jwt(token: str) -> str:
     """
     Cryptographically verifies a Supabase JWT token:
-    1. Fast in-memory cache lookup (<0.01ms).
+    1. Fast in-memory cache lookup (<0.01ms) with revocation enforcement.
     2. Local HS256 HMAC-SHA256 signature verification if SUPABASE_JWT_SECRET is configured.
     3. Asymmetric (ES256/RS256) fallback verification via Supabase GoTrue (/auth/v1/user).
     Raises HTTPException(401) on forged, expired, or invalid tokens.
@@ -234,11 +281,20 @@ async def verify_supabase_jwt(token: str) -> str:
     now = time.time()
     token_hash = hashlib.sha256(clean_token.encode("utf-8")).hexdigest()
 
-    # 1. Fast cache check
+    # 1. Fast cache and explicit revocation check
     with _jwt_cache_lock:
+        revoked_until = _revoked_token_hashes.get(token_hash)
+        if revoked_until is not None:
+            if now < revoked_until:
+                raise HTTPException(status_code=401, detail="Token has been revoked")
+            _revoked_token_hashes.pop(token_hash, None)
         cached = _verified_jwt_cache.get(token_hash)
         if cached:
-            user_id, expires_at = cached
+            user_id, expires_at, cached_iat = cached
+            revoked_before = _user_revoked_before.get(user_id, 0.0)
+            if revoked_before > 0.0 and (cached_iat is None or cached_iat <= revoked_before):
+                _verified_jwt_cache.pop(token_hash, None)
+                raise HTTPException(status_code=401, detail="Token has been revoked")
             if now < expires_at:
                 return user_id
             else:
@@ -250,24 +306,61 @@ async def verify_supabase_jwt(token: str) -> str:
 
     header_b64, payload_b64, sig_b64 = parts
 
-    # Parse payload structure without trusting unverified claims
+    # Parse header and payload structure without trusting unverified claims
     try:
+        raw_header = json.loads(_decode_b64url(header_b64).decode("utf-8"))
         raw_payload = json.loads(_decode_b64url(payload_b64).decode("utf-8"))
     except Exception:
-        raise HTTPException(status_code=401, detail="Malformed JWT payload")
+        raise HTTPException(status_code=401, detail="Malformed JWT token")
+
+    if not isinstance(raw_header, dict) or not isinstance(raw_payload, dict):
+        raise HTTPException(status_code=401, detail="Malformed JWT token")
 
     exp = raw_payload.get("exp")
-    if exp is not None:
-        try:
-            exp_val = float(exp)
-            if now > exp_val:
-                raise HTTPException(status_code=401, detail="Token has expired")
-        except ValueError:
-            raise HTTPException(status_code=401, detail="Invalid token expiration claim")
-    else:
-        exp_val = now + 3600.0
+    if exp is None or isinstance(exp, bool):
+        raise HTTPException(status_code=401, detail="Token missing required exp claim")
+    try:
+        exp_val = float(exp)
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=401, detail="Invalid token expiration claim")
+    if now > exp_val:
+        raise HTTPException(status_code=401, detail="Token has expired")
 
-    user_id = raw_payload.get("sub") or raw_payload.get("id")
+    nbf = raw_payload.get("nbf")
+    if nbf is not None:
+        if isinstance(nbf, bool):
+            raise HTTPException(status_code=401, detail="Invalid token not-before claim")
+        try:
+            nbf_val = float(nbf)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=401, detail="Invalid token not-before claim")
+        if now < nbf_val:
+            raise HTTPException(status_code=401, detail="Token not yet valid")
+
+    aud = raw_payload.get("aud")
+    if not (aud == "authenticated" or (isinstance(aud, list) and "authenticated" in aud)):
+        raise HTTPException(status_code=401, detail="Invalid token audience")
+
+    expected_iss = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1" if settings.SUPABASE_URL else ""
+    if expected_iss and raw_payload.get("iss") and raw_payload.get("iss") != expected_iss:
+        raise HTTPException(status_code=401, detail="Invalid token issuer")
+
+    user_id = raw_payload.get("sub")
+    if not user_id or not isinstance(user_id, str):
+        raise HTTPException(status_code=401, detail="Token missing required sub claim")
+
+    iat_val: Optional[float] = None
+    iat = raw_payload.get("iat")
+    if iat is not None and not isinstance(iat, bool):
+        try:
+            iat_val = float(iat)
+        except (TypeError, ValueError):
+            pass
+
+    revoked_before = _user_revoked_before.get(str(user_id), 0.0)
+    if revoked_before > 0.0 and (iat_val is None or iat_val <= revoked_before):
+        raise HTTPException(status_code=401, detail="Token has been revoked")
+
     verified = False
 
     # 2. HS256 local cryptographic verification if secret configured
@@ -280,27 +373,36 @@ async def verify_supabase_jwt(token: str) -> str:
     )
 
     if is_valid_secret:
-        # Check using PyJWT if installed
+        # Check using PyJWT
         try:
             import jwt
+            options = {
+                "require": ["exp", "sub"],
+                "verify_exp": True,
+                "verify_nbf": True,
+                "verify_aud": True,
+                "verify_iss": bool(expected_iss),
+            }
             decoded = jwt.decode(
                 clean_token,
                 jwt_secret,
                 algorithms=["HS256"],
-                options={"verify_aud": False, "verify_exp": True}
+                audience="authenticated",
+                issuer=expected_iss if expected_iss else None,
+                options=options,
             )
-            user_id = decoded.get("sub") or decoded.get("id")
-            verified = True
+            user_id = decoded.get("sub")
+            verified = bool(user_id)
         except ImportError:
-            # Fallback to standard library HMAC-SHA256
-            try:
-                signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
-                expected_sig = hmac.new(jwt_secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
-                actual_sig = _decode_b64url(sig_b64)
-                if hmac.compare_digest(expected_sig, actual_sig):
-                    verified = True
-            except Exception:
-                verified = False
+            if raw_header.get("alg") == "HS256":
+                try:
+                    signing_input = f"{header_b64}.{payload_b64}".encode("utf-8")
+                    expected_sig = hmac.new(jwt_secret.encode("utf-8"), signing_input, hashlib.sha256).digest()
+                    actual_sig = _decode_b64url(sig_b64)
+                    if hmac.compare_digest(expected_sig, actual_sig):
+                        verified = True
+                except Exception:
+                    verified = False
         except Exception as e:
             logger.debug(f"PyJWT local verification notice: {e}")
             verified = False
@@ -314,15 +416,20 @@ async def verify_supabase_jwt(token: str) -> str:
             "Authorization": f"Bearer {clean_token}"
         }
         try:
-            async with httpx.AsyncClient(timeout=8.0) as client:
-                resp = await client.get(url, headers=headers)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    user_id = data.get("id") or user_id
-                    if user_id:
-                        verified = True
-                else:
-                    logger.debug(f"GoTrue token verification returned {resp.status_code}")
+            client = db.get_http_client()
+            resp = await client.get(url, headers=headers)
+            if resp.status_code == 200:
+                data = resp.json()
+                user_id = data.get("id") or user_id
+                if user_id:
+                    revoked_before = _user_revoked_before.get(str(user_id), 0.0)
+                    if revoked_before > 0.0 and (iat_val is None or iat_val <= revoked_before):
+                        raise HTTPException(status_code=401, detail="Token has been revoked")
+                    verified = True
+            else:
+                logger.debug(f"GoTrue token verification returned {resp.status_code}")
+        except HTTPException:
+            raise
         except Exception as e:
             logger.warning(f"GoTrue token verification network notice: {e}")
 
@@ -332,7 +439,7 @@ async def verify_supabase_jwt(token: str) -> str:
     # Cache successful cryptographic verification for min(exp, now + 300) seconds
     cache_ttl = min(float(exp_val), now + 300.0)
     with _jwt_cache_lock:
-        _verified_jwt_cache[token_hash] = (str(user_id), cache_ttl)
+        _verified_jwt_cache[token_hash] = (str(user_id), cache_ttl, iat_val)
 
     return str(user_id)
 
@@ -355,3 +462,26 @@ async def require_authenticated_user(credentials: Optional[HTTPAuthorizationCred
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Authentication required: Missing Bearer token")
     return await verify_supabase_jwt(credentials.credentials)
+
+
+def get_active_cloudflared_origin() -> Optional[str]:
+    """
+    Returns the exact active Cloudflare Quick Tunnel origin for THIS host
+    if one is running and logged, preventing acceptance of arbitrary attacker *.trycloudflare.com tunnels.
+    """
+    try:
+        log_paths = [
+            Path(settings.BASE_DIR) / "logs" / "cloudflared.log",
+            Path(os.getcwd()) / "logs" / "cloudflared.log",
+            Path(settings.BASE_DIR).parent / "logs" / "cloudflared.log",
+        ]
+        for log_path in log_paths:
+            if log_path.is_file():
+                content = log_path.read_text(encoding="utf-8", errors="ignore")
+                matches = re.findall(r"https://[a-zA-Z0-9-]+\.trycloudflare\.com", content)
+                if matches:
+                    return matches[-1].rstrip("/")
+    except Exception:
+        pass
+    return None
+

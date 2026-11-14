@@ -10,7 +10,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      - MEDIA_SERVER_HOST=0.0.0.0
+      - MEDIA_SERVER_HOST=127.0.0.1
       - MEDIA_SERVER_PORT=8000
       - MEDIA_INCOMING_DIR=/media/incoming
       - MEDIA_LIBRARY_DIR=/media/library
@@ -37,9 +37,11 @@ services:
     container_name: streamvault-aria2
     restart: unless-stopped
     network_mode: host
+    command: --rpc-listen-all=false
     environment:
       - RPC_SECRET=${ARIA2_RPC_SECRET}
       - RPC_PORT=6800
+      - RPC_LISTEN_ALL=false
       - LISTEN_PORT=6888
       - DOWNLOAD_DIR=/media/incoming
     volumes:
@@ -53,12 +55,13 @@ services:
       dockerfile: Dockerfile
     container_name: streamvault-frontend
     restart: unless-stopped
-    ports:
-      - "5173:80"
+    network_mode: host
     environment:
       - VITE_SUPABASE_URL=${VITE_SUPABASE_URL}
       - VITE_SUPABASE_ANON_KEY=${VITE_SUPABASE_ANON_KEY}
       - VITE_MEDIA_SERVER_URL=${VITE_MEDIA_SERVER_URL}
+    volumes:
+      - ./media/library:/media/library
 
   # 4. Decoupled Local Admin Panel (127.0.0.1:4000)
   admin-local:
