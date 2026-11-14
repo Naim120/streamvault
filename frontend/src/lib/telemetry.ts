@@ -10,66 +10,17 @@ export interface DualStackIPs {
   ipv6: string | null;
 }
 
-const STORAGE_KEY_IPS = 'streamvault_dual_stack_ips';
 const STORAGE_KEY_SESSION_ID = 'streamvault_telemetry_session_id';
 
-async function fetchWithTimeout(url: string, timeoutMs: number = 2500): Promise<string | null> {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, { signal: controller.signal });
-    clearTimeout(id);
-    if (!res.ok) return null;
-    const contentType = res.headers.get('content-type') || '';
-    if (contentType.includes('application/json')) {
-      const data = await res.json();
-      return (data?.ip || '').trim() || null;
-    }
-    const text = await res.text();
-    return text.trim() || null;
-  } catch {
-    clearTimeout(id);
-    return null;
-  }
-}
-
 /**
- * Discovers dual-stack IPv4 and IPv6 addresses in parallel.
- * Results are cached in sessionStorage for the lifetime of the browser tab.
+ * Dual-Stack IP resolution:
+ * StreamVault's backend automatically resolves and validates the client's public
+ * IPv4 and IPv6 addresses directly from Cloudflare (CF-Connecting-IP, CF-Connecting-IPv6)
+ * and Nginx gateway headers. We avoid external third-party queries (api6.ipify.org) to eliminate
+ * ERR_NAME_NOT_RESOLVED console errors on networks without IPv6 routing.
  */
 export async function probeDualStackIPs(): Promise<DualStackIPs> {
-  if (typeof window === 'undefined') {
-    return { ipv4: null, ipv6: null };
-  }
-
-  try {
-    const cached = sessionStorage.getItem(STORAGE_KEY_IPS);
-    if (cached) {
-      const parsed = JSON.parse(cached);
-      if (parsed && (parsed.ipv4 || parsed.ipv6)) {
-        return parsed;
-      }
-    }
-  } catch {}
-
-  const [v4Result, v6Result] = await Promise.allSettled([
-    // IPv4 Probe with fallback
-    fetchWithTimeout('https://api4.ipify.org?format=json', 2500)
-      .then((ip) => ip || fetchWithTimeout('https://ipv4.icanhazip.com', 2500)),
-    // IPv6 Probe with fallback
-    fetchWithTimeout('https://api6.ipify.org?format=json', 2500)
-      .then((ip) => ip || fetchWithTimeout('https://ipv6.icanhazip.com', 2500))
-  ]);
-
-  const ipv4 = v4Result.status === 'fulfilled' ? v4Result.value : null;
-  const ipv6 = v6Result.status === 'fulfilled' ? v6Result.value : null;
-
-  const result: DualStackIPs = { ipv4, ipv6 };
-  try {
-    sessionStorage.setItem(STORAGE_KEY_IPS, JSON.stringify(result));
-  } catch {}
-
-  return result;
+  return { ipv4: null, ipv6: null };
 }
 
 export function getCachedSessionLogId(): string | null {
