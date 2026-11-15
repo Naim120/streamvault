@@ -94,6 +94,11 @@ export async function startTelemetrySession(
       const sessionId = data?.session_log_id || null;
       setCachedSessionLogId(sessionId);
       return sessionId;
+    } else if (res.status === 401) {
+      clearTelemetrySession();
+      if (typeof window !== 'undefined') {
+        window.dispatchEvent(new Event('sv:auth-revoked'));
+      }
     }
   } catch (err) {
     console.warn('Telemetry session start warning:', err);
@@ -165,9 +170,10 @@ export async function sendTelemetryHeartbeat(
 
     // If heartbeat returns 401, refresh session and retry once
     if (res.status === 401) {
+      let refreshed = false;
       try {
-        const { data: refreshData } = await supabase.auth.refreshSession();
-        if (refreshData?.session?.access_token) {
+        const { data: refreshData, error: refreshErr } = await supabase.auth.refreshSession();
+        if (!refreshErr && refreshData?.session?.access_token) {
           token = refreshData.session.access_token;
           res = await fetch(resolveApiUrl('/api/telemetry/heartbeat'), {
             method: 'POST',
@@ -177,8 +183,17 @@ export async function sendTelemetryHeartbeat(
             },
             body: bodyStr
           });
+          refreshed = res.ok;
         }
       } catch {}
+
+      if (!refreshed && res.status === 401) {
+        clearTelemetrySession();
+        if (typeof window !== 'undefined') {
+          window.dispatchEvent(new Event('sv:auth-revoked'));
+        }
+        return;
+      }
     }
 
     if (res.ok) {

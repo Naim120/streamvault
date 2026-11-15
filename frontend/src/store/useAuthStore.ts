@@ -187,6 +187,22 @@ function registerAuthListeners(get: () => AuthState, set: (fn: Partial<AuthState
 
     window.addEventListener('visibilitychange', handleSilentRevalidate);
     window.addEventListener('online', handleSilentRevalidate);
+
+    window.addEventListener('sv:auth-revoked', async () => {
+      clearClientUserState();
+      await supabase.auth.signOut().catch(() => {});
+      set({
+        user: null,
+        session: null,
+        profile: null,
+        isEmailConfirmed: false,
+        isPasswordRecovery: false
+      });
+      if (typeof window !== 'undefined' && window.location.pathname.startsWith('/home')) {
+        window.history.replaceState({}, '', '/');
+        window.dispatchEvent(new Event('sv:navigation'));
+      }
+    });
   }
 }
 
@@ -503,8 +519,15 @@ export const useAuthStore = create<AuthState>((set, get) => ({
           display_name: user.user_metadata?.full_name || user.email?.split('@')[0],
           avatar_url: 'https://images.unsplash.com/photo-1534528741775-53994a69daeb?w=150'
         };
-        await supabase.from('profiles').insert(newProf);
+        const { error: insertErr } = await supabase.from('profiles').insert(newProf);
+        if (insertErr) {
+          console.warn('Profile does not exist and cannot be created. Evicting session:', insertErr);
+          await get().signOut();
+          return;
+        }
         set({ profile: newProf as any });
+      } else if (error && (error.code === 'PGRST301' || error.message?.includes('JWT') || error.message?.includes('claim') || error.code === '401')) {
+        await get().signOut();
       }
     } catch (e) {
       console.error('Failed to load profile:', e);
