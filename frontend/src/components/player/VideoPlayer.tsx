@@ -178,7 +178,7 @@ export const VideoPlayer: React.FC = () => {
   const controlsTimeoutRef = useRef<any>(null);
   const progressBarRef = useRef<HTMLDivElement | null>(null);
   const isScrubbingRef = useRef<boolean>(false);
-  const needsClockNudgeRef = useRef<boolean>(false);
+  const isLoadStoppedByPauseRef = useRef<boolean>(false);
 
   const initialTimeFromStore = (startSeconds && startSeconds > 5) ? startSeconds : 0;
   const [initialSeekTime, setInitialSeekTime] = useState<number>(initialTimeFromStore);
@@ -214,6 +214,7 @@ export const VideoPlayer: React.FC = () => {
     hasAppliedDefaultAudioRef.current = false;
     hasAppliedSavedSubRef.current = false;
     savedPrefsRef.current = null;
+    isLoadStoppedByPauseRef.current = false;
     setPlaybackConfig(null);
     const known = (episode?.duration_seconds && episode.duration_seconds > 0 ? episode.duration_seconds : 0) ||
       (media?.runtime_minutes && media.runtime_minutes > 0 ? media.runtime_minutes * 60 : 0) ||
@@ -227,10 +228,17 @@ export const VideoPlayer: React.FC = () => {
   const vttCacheRef = useRef<Record<string, VttCue[]>>({});
   const activeCuesRef = useRef<VttCue[]>([]);
 
+  const resumeHlsLoadIfPaused = useCallback(() => {
+    if (isLoadStoppedByPauseRef.current && hlsRef.current) {
+      isLoadStoppedByPauseRef.current = false;
+      hlsRef.current.startLoad();
+    }
+  }, []);
+
   const safePlay = useCallback(async (video: HTMLVideoElement | null) => {
     if (!video) return;
     try {
-      hlsRef.current?.startLoad();
+      resumeHlsLoadIfPaused();
       await video.play();
       setIsPlaying(true);
       setStoreIsPlaying(true);
@@ -239,7 +247,7 @@ export const VideoPlayer: React.FC = () => {
         console.warn('Playback interrupted non-fatally:', err);
       }
     }
-  }, [setStoreIsPlaying]);
+  }, [setStoreIsPlaying, resumeHlsLoadIfPaused]);
 
   // Playback state
   const [isPlaying, setIsPlaying] = useState(false);
@@ -415,6 +423,23 @@ export const VideoPlayer: React.FC = () => {
           activeCuesRef.current = [];
           setActiveCueText('');
         }
+      }
+
+      const initialAudioTracks = (tracksData?.audio_tracks && tracksData.audio_tracks.length > 0)
+        ? tracksData.audio_tracks
+        : tokenData.audio_tracks;
+
+      if (initialAudioTracks && Array.isArray(initialAudioTracks) && initialAudioTracks.length > 0) {
+        const initialStreamObj: any = {
+          media_id: episode ? null : actualId,
+          episode_id: episode ? actualId : null,
+          audio_tracks: initialAudioTracks,
+          subtitle_tracks: rawSubs || [],
+          available_qualities: tokenData.available_qualities || ['Original'],
+          processing_status: 'ready',
+        };
+        streamInfoRef.current = initialStreamObj;
+        setStreamInfo(initialStreamObj);
       }
 
       setInitialSeekTime(seekSec);
@@ -628,30 +653,43 @@ export const VideoPlayer: React.FC = () => {
         hlsRef.current = null;
       }
 
+      isLoadStoppedByPauseRef.current = false;
+
+      const navConn = typeof navigator !== 'undefined' ? (navigator as any).connection : null;
+      const isSlowNetwork = Boolean(
+        navConn &&
+        (navConn.saveData ||
+         ['slow-2g', '2g', '3g'].includes(navConn.effectiveType) ||
+         (typeof navConn.downlink === 'number' && navConn.downlink > 0 && navConn.downlink < 2.0))
+      );
+      const defaultBwEstimate = isSlowNetwork ? 450000 : 2500000;
+
       const hls = new Hls({
         enableWorker: true,
         lowLatencyMode: false,
         startPosition: startAtSeconds > 5 ? startAtSeconds : -1,
-        startFragPrefetch: true,
+        startFragPrefetch: startAtSeconds <= 5,
         startLevel: -1,
-        capLevelToPlayerSize: false,
-        abrEwmaDefaultEstimate: 2500000,
-        abrBandWidthFactor: 0.75,
+        capLevelToPlayerSize: true,
+        abrEwmaDefaultEstimate: defaultBwEstimate,
+        abrBandWidthFactor: 0.7,
         abrBandWidthUpFactor: 0.5,
-        maxStarvationDelay: 2,
+        maxStarvationDelay: 4,
+        maxLoadingDelay: 4,
         maxBufferLength: 30,             // Keep white bar strictly ~30s ahead of red playhead
         maxMaxBufferLength: 45,          // Hard ceiling: never buffer more than 45s ahead
         maxBufferSize: 25 * 1000 * 1000, // Hard 25 MB memory/bandwidth cap ahead of playhead
         backBufferLength: 15,            // Evict segments >15s behind playhead to free RAM
         maxBufferHole: 0.5,
-        highBufferWatchdogPeriod: 1,
+        highBufferWatchdogPeriod: 2,
         nudgeOffset: 0.1,
         nudgeMaxRetry: 5,
-        fragLoadingTimeOut: 15000,
-        manifestLoadingTimeOut: 10000,
-        manifestLoadingMaxRetry: 3,
-        levelLoadingMaxRetry: 3,
-        fragLoadingMaxRetry: 4,
+        fragLoadingTimeOut: 60000,
+        manifestLoadingTimeOut: 20000,
+        levelLoadingTimeOut: 20000,
+        manifestLoadingMaxRetry: 4,
+        levelLoadingMaxRetry: 4,
+        fragLoadingMaxRetry: 6,
         renderTextTracksNatively: false,
       });
 
@@ -675,16 +713,15 @@ export const VideoPlayer: React.FC = () => {
             activeEnd = v.buffered.end(v.buffered.length - 1);
           }
           if (activeEnd - v.currentTime >= 15) {
+            isLoadStoppedByPauseRef.current = true;
             hlsRef.current?.stopLoad();
           }
         }
         if (videoRef.current && videoRef.current.readyState >= 3) {
           setIsBuffering(false);
-          if (needsClockNudgeRef.current) {
-            needsClockNudgeRef.current = false;
-            if (videoRef.current) {
-              videoRef.current.currentTime = videoRef.current.currentTime;
-            }
+          const v = videoRef.current;
+          if (v.paused && isPlaying) {
+            v.play().catch(() => {});
           }
         }
       });
@@ -810,23 +847,27 @@ export const VideoPlayer: React.FC = () => {
           return;
         }
 
-        if (
-          data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR ||
-          data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT
-        ) {
+        if (data.details === Hls.ErrorDetails.BUFFER_STALLED_ERROR) {
           setIsBuffering(true);
           if (hls.currentLevel > 0 && currentQuality === 'Auto') {
             hls.nextLoadLevel = Math.max(0, hls.currentLevel - 1);
           }
-          hls.startLoad();
-          needsClockNudgeRef.current = true;
-          if (videoRef.current) {
-            videoRef.current.currentTime = videoRef.current.currentTime;
+          if (isLoadStoppedByPauseRef.current) {
+            resumeHlsLoadIfPaused();
+          }
+        } else if (data.details === Hls.ErrorDetails.FRAG_LOAD_TIMEOUT) {
+          setIsBuffering(true);
+          if (hls.currentLevel > 0 && currentQuality === 'Auto') {
+            hls.nextLoadLevel = 0;
+          }
+          if (isLoadStoppedByPauseRef.current) {
+            resumeHlsLoadIfPaused();
           }
         }
         if (data.fatal) {
           switch (data.type) {
             case Hls.ErrorTypes.NETWORK_ERROR:
+              isLoadStoppedByPauseRef.current = false;
               hls.startLoad();
               break;
             case Hls.ErrorTypes.MEDIA_ERROR:
@@ -869,7 +910,7 @@ export const VideoPlayer: React.FC = () => {
         hlsRef.current = null;
       }
     };
-  }, [playbackConfig?.manifestUrl, isTrailer, safePlay, updateBufferedProgress]);
+  }, [playbackConfig?.manifestUrl, isTrailer, safePlay, updateBufferedProgress, resumeHlsLoadIfPaused]);
 
   // 2a. Re-sync audio tracks when streamInfo loads from Supabase
   useEffect(() => {
@@ -1192,7 +1233,7 @@ export const VideoPlayer: React.FC = () => {
     scheduleControlsHide();
     if (!videoRef.current) return;
     if (videoRef.current.paused) {
-      hlsRef.current?.startLoad();
+      resumeHlsLoadIfPaused();
       safePlay(videoRef.current);
     } else {
       videoRef.current.pause();
@@ -1211,6 +1252,7 @@ export const VideoPlayer: React.FC = () => {
           activeEnd = v.buffered.end(v.buffered.length - 1);
         }
         if (activeEnd - v.currentTime >= 15) {
+          isLoadStoppedByPauseRef.current = true;
           hlsRef.current?.stopLoad();
         }
       }
@@ -1223,7 +1265,7 @@ export const VideoPlayer: React.FC = () => {
   const handleSeek = (newTime: number) => {
     scheduleControlsHide();
     if (!videoRef.current) return;
-    hlsRef.current?.startLoad();
+    resumeHlsLoadIfPaused();
     videoRef.current.currentTime = newTime;
     setCurrentTime(newTime);
   };
@@ -1231,7 +1273,7 @@ export const VideoPlayer: React.FC = () => {
   const skipSeconds = (seconds: number) => {
     scheduleControlsHide();
     if (!videoRef.current) return;
-    hlsRef.current?.startLoad();
+    resumeHlsLoadIfPaused();
     videoRef.current.currentTime = Math.max(0, Math.min(videoRef.current.duration || 0, videoRef.current.currentTime + seconds));
   };
 
@@ -1563,7 +1605,7 @@ export const VideoPlayer: React.FC = () => {
     const bar = progressBarRef.current;
     const video = videoRef.current;
     if (!bar || !video || !duration) return;
-    hlsRef.current?.startLoad();
+    resumeHlsLoadIfPaused();
     const rect = bar.getBoundingClientRect();
     const ratio = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
     const targetTime = ratio * duration;
@@ -1802,12 +1844,12 @@ export const VideoPlayer: React.FC = () => {
           }
         }}
         onPlay={() => {
-          hlsRef.current?.startLoad();
+          resumeHlsLoadIfPaused();
           setIsPlaying(true);
           setStoreIsPlaying(true);
         }}
         onPlaying={() => {
-          hlsRef.current?.startLoad();
+          resumeHlsLoadIfPaused();
           setIsBuffering(false);
           setIsPlaying(true);
           setStoreIsPlaying(true);
@@ -1829,6 +1871,7 @@ export const VideoPlayer: React.FC = () => {
               activeEnd = video.buffered.end(video.buffered.length - 1);
             }
             if (activeEnd - video.currentTime >= 15) {
+              isLoadStoppedByPauseRef.current = true;
               hlsRef.current?.stopLoad();
             }
           }
