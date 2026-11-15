@@ -140,7 +140,7 @@ export function useTVNavigation() {
       if (playerOpen) {
         if (['Escape', 'GoBack', 'BrowserBack'].includes(e.key) || e.keyCode === 4) {
           e.preventDefault();
-          usePlayerStore.getState().closePlayer();
+          window.dispatchEvent(new CustomEvent('sv:hardware-back-from-player'));
         }
         return;
       }

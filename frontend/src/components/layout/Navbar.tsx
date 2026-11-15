@@ -1,7 +1,8 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { Search, ChevronDown, User, LogOut, Check, Home } from 'lucide-react';
+import { Search, ChevronDown, User, LogOut, Check, Home, KeyRound } from 'lucide-react';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useUIStore } from '../../store/useUIStore';
+import { ChangePasswordModal } from '../auth/ChangePasswordModal';
 
 export const Navbar: React.FC = () => {
   const { user, profile, signOut } = useAuthStore();
@@ -10,6 +11,7 @@ export const Navbar: React.FC = () => {
   const [isScrolled, setIsScrolled] = useState(false);
   const [showGenreMenu, setShowGenreMenu] = useState(false);
   const [showProfileMenu, setShowProfileMenu] = useState(false);
+  const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
 
   const genreMenuRef = useRef<HTMLDivElement | null>(null);
   const profileMenuRef = useRef<HTMLDivElement | null>(null);
@@ -183,6 +185,14 @@ export const Navbar: React.FC = () => {
                   </button>
 
                   <button
+                    onClick={() => { setShowChangePasswordModal(true); setShowProfileMenu(false); }}
+                    className="w-full text-left px-3 py-2 rounded-xl text-xs text-neutral-300 hover:bg-neutral-800 hover:text-white transition flex items-center gap-2.5 cursor-pointer"
+                  >
+                    <KeyRound className="w-4 h-4 text-neutral-400" />
+                    <span>Change Password</span>
+                  </button>
+
+                  <button
                     onClick={() => { signOut(); setShowProfileMenu(false); }}
                     className="w-full text-left px-3 py-2 rounded-xl text-xs text-red-400 hover:bg-red-600/15 transition flex items-center gap-2.5 mt-1 cursor-pointer"
                   >
@@ -232,6 +242,11 @@ export const Navbar: React.FC = () => {
           <span className="text-[10px]">Profile</span>
         </button>
       </div>
+
+      <ChangePasswordModal
+        isOpen={showChangePasswordModal}
+        onClose={() => setShowChangePasswordModal(false)}
+      />
     </>
   );
 };

@@ -5,16 +5,24 @@ import re
 import socket
 import threading
 import time
+import uuid
 from collections import defaultdict, deque
 from typing import Optional
 import urllib.parse
 import httpx
-from fastapi import APIRouter, HTTPException, Request, Response
+from fastapi import APIRouter, HTTPException, Request, Response, Depends, Security
 from fastapi.responses import JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials
 from pydantic import BaseModel, Field
 from ..config import settings
 from ..database import db
-from ..security import extract_trusted_client_ip, get_active_cloudflared_origin
+from ..security import (
+    extract_trusted_client_ip,
+    get_active_cloudflared_origin,
+    require_authenticated_user,
+    revoke_user_tokens,
+    bearer_scheme
+)
 
 logger = logging.getLogger(__name__)
 
@@ -679,5 +687,243 @@ async def verification_status(payload: VerificationStatusRequest, request: Reque
         "is_verified": is_verified,
         "cooldown_remaining_seconds": cooldown_remaining,
         "last_sent_seconds_ago": elapsed_seconds
+    }
+
+
+# ---------------------------------------------------------------------------
+# Change Password & Account Deletion (Caller-Authenticated Only)
+# ---------------------------------------------------------------------------
+
+class ChangePasswordRequest(BaseModel):
+    old_password: str = Field(..., min_length=1, max_length=128)
+    new_password: str = Field(..., min_length=8, max_length=128)
+
+
+class DeleteAccountRequest(BaseModel):
+    password: str = Field(..., min_length=1, max_length=128)
+    confirmation: str = Field(..., min_length=1, max_length=32)
+
+
+async def get_user_email_by_id(user_id: str) -> Optional[str]:
+    """
+    Safely resolves user's canonical email exclusively from server-side
+    database or Supabase Admin Auth API using service role key.
+    """
+    try:
+        profiles = await db.select("profiles", {"id": f"eq.{user_id}"})
+        if profiles and profiles[0].get("email"):
+            return profiles[0]["email"].strip().lower()
+    except Exception as e:
+        logger.warning(f"Error resolving email from profiles for {user_id}: {e}")
+
+    try:
+        client = db.get_http_client()
+        url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
+        admin_key = settings.SUPABASE_SERVICE_ROLE_KEY
+        resp = await client.get(
+            url,
+            headers={"apikey": admin_key, "Authorization": f"Bearer {admin_key}"}
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if data.get("email"):
+                return data["email"].strip().lower()
+    except Exception as e:
+        logger.warning(f"Error resolving email from Supabase Admin API for {user_id}: {e}")
+
+    return None
+
+
+@router.post("/change-password")
+async def change_password(
+    payload: ChangePasswordRequest,
+    request: Request,
+    user_id: str = Depends(require_authenticated_user),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme)
+):
+    """
+    Secure password change endpoint:
+    1. Validates caller's cryptographic user identity.
+    2. Verifies old_password against Supabase Auth.
+    3. Updates password via Supabase Admin API.
+    4. Forcefully revokes session tokens and signs out active profile.
+    """
+    client_ip = get_client_ip(request)
+    check_ip_rate_limit(client_ip)
+
+    # Validate user_id as a valid UUID
+    try:
+        val_uuid = str(uuid.UUID(str(user_id).strip()))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid user authentication identity.")
+
+    # Reject null bytes
+    if '\x00' in payload.old_password or '\x00' in payload.new_password:
+        raise HTTPException(status_code=400, detail="Invalid character in password.")
+
+    clean_new_pass = payload.new_password.strip()
+    clean_old_pass = payload.old_password.strip()
+
+    if clean_new_pass == clean_old_pass:
+        raise HTTPException(status_code=400, detail="New password must be different from your current password.")
+    if len(clean_new_pass) < 8:
+        raise HTTPException(status_code=400, detail="New password must be at least 8 characters long.")
+
+    # Resolve user email on server
+    user_email = await get_user_email_by_id(val_uuid)
+    if not user_email:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # Verify old_password against Supabase Auth
+    client = db.get_http_client()
+    token_url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
+    token_resp = await client.post(
+        token_url,
+        headers={"apikey": settings.SUPABASE_ANON_KEY, "Content-Type": "application/json"},
+        json={"email": user_email, "password": payload.old_password}
+    )
+    if token_resp.status_code != 200:
+        record_ip_success(client_ip)
+        raise HTTPException(status_code=400, detail="Your current password is incorrect.")
+
+    # Update Password Exclusively for user_id via Supabase Admin API
+    update_url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{val_uuid}"
+    admin_key = settings.SUPABASE_SERVICE_ROLE_KEY
+    update_resp = await client.put(
+        update_url,
+        headers={
+            "apikey": admin_key,
+            "Authorization": f"Bearer {admin_key}",
+            "Content-Type": "application/json"
+        },
+        json={"password": payload.new_password}
+    )
+    if update_resp.status_code >= 400:
+        logger.error(f"Failed to update password for user {val_uuid}: {update_resp.status_code} {update_resp.text}")
+        raise HTTPException(status_code=400, detail="Failed to update password. Please choose a stronger password.")
+
+    # Force Logout & Session Revocation
+    bearer_token = credentials.credentials if credentials else None
+    revoke_user_tokens(val_uuid, bearer_token)
+
+    now_iso = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    try:
+        await db.update(
+            "profiles",
+            "id",
+            val_uuid,
+            {
+                "is_signed_out": True,
+                "last_logout_at": now_iso,
+                "current_activity": "Offline"
+            }
+        )
+        await db.update_where(
+            "user_login_logs",
+            {"user_id": f"eq.{val_uuid}", "logged_out_at": "is.null"},
+            {"logged_out_at": now_iso}
+        )
+    except Exception as e:
+        logger.warning(f"Profile logout status update warning for {val_uuid}: {e}")
+
+    return {
+        "status": "password_changed",
+        "message": "Password changed successfully. Please sign in with your new password."
+    }
+
+
+@router.post("/delete-account")
+async def delete_account(
+    payload: DeleteAccountRequest,
+    request: Request,
+    user_id: str = Depends(require_authenticated_user),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(bearer_scheme)
+):
+    """
+    Permanently deletes user account, custom lists, watch history, likes, and profile.
+    Requires password re-authentication and typed DELETE confirmation.
+    """
+    client_ip = get_client_ip(request)
+    check_ip_rate_limit(client_ip)
+
+    # Validate user_id as a valid UUID
+    try:
+        val_uuid = str(uuid.UUID(str(user_id).strip()))
+    except (ValueError, AttributeError):
+        raise HTTPException(status_code=400, detail="Invalid user authentication identity.")
+
+    # Reject null bytes
+    if '\x00' in payload.password or '\x00' in payload.confirmation:
+        raise HTTPException(status_code=400, detail="Invalid character in request.")
+
+    if payload.confirmation.strip().upper() != "DELETE":
+        raise HTTPException(status_code=400, detail="Please type DELETE to confirm account deletion.")
+
+    # Resolve user email on server
+    user_email = await get_user_email_by_id(val_uuid)
+    if not user_email:
+        raise HTTPException(status_code=404, detail="User account not found.")
+
+    # Verify password against Supabase Auth
+    client = db.get_http_client()
+    token_url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/token?grant_type=password"
+    token_resp = await client.post(
+        token_url,
+        headers={"apikey": settings.SUPABASE_ANON_KEY, "Content-Type": "application/json"},
+        json={"email": user_email, "password": payload.password}
+    )
+    if token_resp.status_code != 200:
+        record_ip_success(client_ip)
+        raise HTTPException(status_code=400, detail="Incorrect password. Account deletion aborted.")
+
+    # 1. Telemetry heartbeat buffer cleanup
+    try:
+        from .telemetry import _heartbeat_buffer, LAST_HEARTBEAT_TIME, _buffer_lock
+        async with _buffer_lock:
+            _heartbeat_buffer.pop(val_uuid, None)
+        LAST_HEARTBEAT_TIME.pop(val_uuid, None)
+    except Exception as e:
+        logger.warning(f"Telemetry buffer cleanup warning for {val_uuid}: {e}")
+
+    # 2. Purge user's custom lists and items
+    try:
+        custom_lists = await db.select("custom_lists", {"user_id": f"eq.{val_uuid}"})
+        for cl in custom_lists:
+            lid = cl.get("id")
+            if lid:
+                await db.delete("custom_list_items", "list_id", lid)
+    except Exception as e:
+        logger.warning(f"Error purging custom list items for {val_uuid}: {e}")
+
+    # 3. Purge scoped tables
+    await db.delete("custom_lists", "user_id", val_uuid)
+    await db.delete("user_likes", "user_id", val_uuid)
+    await db.delete("watch_progress", "user_id", val_uuid)
+    await db.delete("watch_history", "user_id", val_uuid)
+    await db.delete("user_login_logs", "user_id", val_uuid)
+    if user_email:
+        await db.delete("auth_email_rate_limits", "email", user_email)
+    await db.delete("profiles", "id", val_uuid)
+
+    # 4. Delete the user from auth.users via Supabase Admin API
+    delete_url = f"{settings.SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{val_uuid}"
+    admin_key = settings.SUPABASE_SERVICE_ROLE_KEY
+    del_resp = await client.delete(
+        delete_url,
+        headers={
+            "apikey": admin_key,
+            "Authorization": f"Bearer {admin_key}"
+        }
+    )
+    if del_resp.status_code >= 400 and del_resp.status_code != 404:
+        logger.warning(f"Supabase auth user delete returned {del_resp.status_code}: {del_resp.text}")
+
+    # 5. Revoke active JWT tokens in memory
+    bearer_token = credentials.credentials if credentials else None
+    revoke_user_tokens(val_uuid, bearer_token)
+
+    return {
+        "status": "account_deleted",
+        "message": "Your account and all associated data have been permanently deleted."
     }
 

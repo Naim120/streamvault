@@ -268,6 +268,9 @@ function MainApp() {
   const syncRouterState = useCallback(async () => {
     if (typeof window === 'undefined') return;
 
+    // If player is currently open, let player's dedicated exit interceptor handle navigation
+    if (usePlayerStore.getState().isOpen) return;
+
     const pathname = window.location.pathname;
     const search = window.location.search;
     const params = new URLSearchParams(search);
@@ -378,6 +381,40 @@ function MainApp() {
     // Route 4: Unknown Path (*) -> 404
     setIsNotFound(true);
   }, [user, isEmailConfirmed, isPasswordRecovery, openDetail, closeDetail]);
+
+  // Global popstate & Hardware Back Interceptor
+  useEffect(() => {
+    const handlePopState = (_e: PopStateEvent) => {
+      const playerState = usePlayerStore.getState();
+      const uiState = useUIStore.getState();
+
+      // Priority 1: If VideoPlayer is currently open, intercept Back button to exit VideoPlayer ONLY!
+      if (playerState.isOpen) {
+        // Dispatch custom event so VideoPlayer flushes watch_progress & exits fullscreen cleanly
+        window.dispatchEvent(new CustomEvent('sv:hardware-back-from-player'));
+        return;
+      }
+
+      // Priority 2: If DetailModal is currently open, intercept Back button to close DetailModal and stay on /home!
+      if (uiState.detailMedia) {
+        uiState.closeDetail();
+        if (window.location.pathname !== '/home') {
+          window.history.replaceState({ svModal: 'home' }, '', '/home');
+        }
+        return;
+      }
+
+      // Priority 3: If on Search or Profile tab, return to Home tab instead of leaving the app!
+      if (uiState.activeTab !== 'home') {
+        uiState.setActiveTab('home');
+        window.history.replaceState({ svModal: 'home' }, '', '/home');
+        return;
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
 
   useEffect(() => {
     syncRouterState();

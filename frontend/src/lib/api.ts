@@ -422,5 +422,43 @@ export const api = {
     const res = await safeFetch(resolveApiUrl('/api/auth/redirect-origin'));
     if (!res.ok) throw new Error('Failed to fetch redirect origin');
     return res.json() as Promise<{ origin: string }>;
+  },
+
+  async changePassword(oldPassword: string, newPassword: string, accessToken: string) {
+    const res = await safeFetch(resolveApiUrl('/api/auth/change-password'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({
+        old_password: oldPassword,
+        new_password: newPassword
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || 'Failed to change password');
+    }
+    return data as { status: string; message: string };
+  },
+
+  async deleteAccount(password: string, confirmation: string, accessToken: string) {
+    const res = await safeFetch(resolveApiUrl('/api/auth/delete-account'), {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`
+      },
+      body: JSON.stringify({
+        password,
+        confirmation
+      })
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(data.detail || 'Failed to delete account');
+    }
+    return data as { status: string; message: string };
   }
 };

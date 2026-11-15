@@ -1,14 +1,19 @@
 import React, { useState, useEffect } from 'react';
-import { Edit2, LogOut, Check, Trash2, Clock, ThumbsUp, Bookmark, Play, X, ChevronLeft, ChevronRight, Server } from 'lucide-react';
+import { 
+  Edit2, LogOut, Check, Trash2, Clock, ThumbsUp, Bookmark, Play, X, 
+  ChevronLeft, ChevronRight, Server, AlertTriangle, KeyRound, Eye, EyeOff, ShieldAlert 
+} from 'lucide-react';
 import { useAuthStore } from '../../store/useAuthStore';
 import { useUIStore } from '../../store/useUIStore';
 import { usePlayerStore } from '../../store/usePlayerStore';
 import { supabase } from '../../lib/supabase';
+import { api } from '../../lib/api';
 import { PRESET_AVATARS } from '../../lib/avatars';
 import { CustomList, Episode, MediaItem, WatchProgressItem } from '../../types';
 import { PosterCard } from '../home/PosterCard';
 import { MediaImage } from '../common/MediaImage';
 import { ServerConfigModal } from '../common/ServerConfigModal';
+import { ChangePasswordModal } from '../auth/ChangePasswordModal';
 
 interface WatchHistoryRow {
   id: string;
@@ -97,12 +102,20 @@ function getPrimaryTitle(item: WatchHistoryRow): string {
 }
 
 export const ProfileScreen: React.FC = () => {
-  const { user, profile, signOut, updateAvatar } = useAuthStore();
+  const { user, session, profile, signOut, updateAvatar } = useAuthStore();
   const { showToast } = useUIStore();
   const { openPlayer } = usePlayerStore();
 
   const [showAvatarModal, setShowAvatarModal] = useState(false);
   const [showServerModal, setShowServerModal] = useState(false);
+  const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
+  const [showDeleteAccountModal, setShowDeleteAccountModal] = useState(false);
+  const [deletePassword, setDeletePassword] = useState('');
+  const [deleteConfirmText, setDeleteConfirmText] = useState('');
+  const [showDeletePassword, setShowDeletePassword] = useState(false);
+  const [isDeletingAccount, setIsDeletingAccount] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
+
   const [continueWatching, setContinueWatching] = useState<WatchProgressItem[]>([]);
   const [likedMedia, setLikedMedia] = useState<MediaItem[]>([]);
   const [customLists, setCustomLists] = useState<CustomList[]>([]);
@@ -263,21 +276,37 @@ export const ProfileScreen: React.FC = () => {
         </div>
 
         {/* Action Buttons */}
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center justify-center sm:justify-end gap-2">
           <button
             onClick={() => setShowServerModal(true)}
-            className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-2"
+            className="px-3.5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-1.5 cursor-pointer"
             title="Configure StreamVault Server / Host Endpoint"
           >
             <Server className="w-4 h-4 text-emerald-400" />
-            Server Settings
+            <span className="hidden sm:inline">Server Settings</span>
+          </button>
+          <button
+            onClick={() => setShowChangePasswordModal(true)}
+            className="px-3.5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-1.5 cursor-pointer"
+            title="Change Password"
+          >
+            <KeyRound className="w-4 h-4 text-amber-400" />
+            <span>Change Password</span>
+          </button>
+          <button
+            onClick={() => setShowDeleteAccountModal(true)}
+            className="px-3.5 py-2.5 bg-red-950/40 hover:bg-red-900/60 border border-red-800/40 text-red-400 font-semibold rounded-xl text-xs transition flex items-center gap-1.5 cursor-pointer"
+            title="Delete Account"
+          >
+            <Trash2 className="w-4 h-4 text-red-500" />
+            <span>Delete Account</span>
           </button>
           <button
             onClick={signOut}
-            className="px-5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-2"
+            className="px-4 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition flex items-center gap-1.5 cursor-pointer"
           >
             <LogOut className="w-4 h-4" />
-            Sign Out
+            <span>Sign Out</span>
           </button>
         </div>
       </div>
@@ -538,10 +567,204 @@ export const ProfileScreen: React.FC = () => {
         )}
       </div>
 
+      {/* Account Security & Danger Zone */}
+      <div className="bg-[#141414] border border-red-900/20 rounded-3xl p-6 sm:p-8 space-y-4 shadow-xl">
+        <div className="flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-red-600/10 border border-red-500/20 flex items-center justify-center text-red-500">
+            <ShieldAlert className="w-5 h-5" />
+          </div>
+          <div>
+            <h3 className="text-white font-bold text-base">Account Security & Danger Zone</h3>
+            <p className="text-neutral-400 text-xs">Manage your account credentials and permanent deletion.</p>
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2">
+          {/* Change Password Card */}
+          <div className="bg-neutral-900/70 border border-neutral-800/80 rounded-2xl p-5 flex flex-col justify-between space-y-4">
+            <div>
+              <div className="flex items-center gap-2 mb-1.5">
+                <KeyRound className="w-4 h-4 text-amber-400" />
+                <h4 className="text-white font-bold text-sm">Update Password</h4>
+              </div>
+              <p className="text-neutral-400 text-xs leading-relaxed">
+                Update your account password. Once changed, all existing browser sessions will be revoked and you will be prompted to sign in with your new password.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowChangePasswordModal(true)}
+              className="px-4 py-2 bg-neutral-800 hover:bg-neutral-700 text-white font-semibold text-xs rounded-xl transition w-fit flex items-center gap-2 cursor-pointer"
+            >
+              Change Password
+            </button>
+          </div>
+
+          {/* Delete Account Card */}
+          <div className="bg-neutral-900/70 border border-red-950/60 rounded-2xl p-5 flex flex-col justify-between space-y-4">
+            <div>
+              <div className="flex items-center gap-2 mb-1.5">
+                <AlertTriangle className="w-4 h-4 text-red-500" />
+                <h4 className="text-red-400 font-bold text-sm">Permanently Delete Account</h4>
+              </div>
+              <p className="text-neutral-400 text-xs leading-relaxed">
+                Permanently erase your StreamVault account, custom lists, watch history, liked titles, and profile. This action cannot be undone.
+              </p>
+            </div>
+            <button
+              onClick={() => setShowDeleteAccountModal(true)}
+              className="px-4 py-2 bg-red-600/20 hover:bg-red-600/30 border border-red-600/40 text-red-400 font-bold text-xs rounded-xl transition w-fit flex items-center gap-2 cursor-pointer"
+            >
+              <Trash2 className="w-3.5 h-3.5" />
+              Delete Account
+            </button>
+          </div>
+        </div>
+      </div>
+
       <ServerConfigModal
         isOpen={showServerModal}
         onClose={() => setShowServerModal(false)}
       />
+
+      <ChangePasswordModal
+        isOpen={showChangePasswordModal}
+        onClose={() => setShowChangePasswordModal(false)}
+      />
+
+      {/* Delete Account Confirmation Modal */}
+      {showDeleteAccountModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/85 backdrop-blur-md animate-fade-in">
+          <div
+            className="bg-[#141414] border border-red-900/40 rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl relative space-y-5 animate-scale-up"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-account-title"
+          >
+            <button
+              onClick={() => {
+                if (isDeletingAccount) return;
+                setShowDeleteAccountModal(false);
+                setDeletePassword('');
+                setDeleteConfirmText('');
+                setDeleteError(null);
+              }}
+              disabled={isDeletingAccount}
+              className="absolute top-5 right-5 text-neutral-400 hover:text-white p-2 rounded-full hover:bg-neutral-800 transition disabled:opacity-40 cursor-pointer"
+              aria-label="Close"
+            >
+              <X className="w-5 h-5" />
+            </button>
+
+            <div className="text-center space-y-2">
+              <div className="w-14 h-14 rounded-2xl bg-red-600/15 border border-red-500/30 text-red-500 flex items-center justify-center mx-auto shadow-inner">
+                <AlertTriangle className="w-7 h-7" />
+              </div>
+              <h2 id="delete-account-title" className="text-2xl font-black text-white tracking-tight">
+                Delete Account
+              </h2>
+              <p className="text-xs text-neutral-400 leading-relaxed">
+                This action is <span className="text-red-400 font-bold uppercase">permanent</span>. Your profile, custom lists, watch history, and likes will be permanently erased.
+              </p>
+            </div>
+
+            {deleteError && (
+              <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-xl text-red-400 text-xs flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>{deleteError}</span>
+              </div>
+            )}
+
+            <div className="space-y-4">
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-neutral-300">Enter Your Password</label>
+                <div className="relative">
+                  <input
+                    type={showDeletePassword ? 'text' : 'password'}
+                    value={deletePassword}
+                    onChange={(e) => setDeletePassword(e.target.value)}
+                    required
+                    disabled={isDeletingAccount}
+                    placeholder="Enter password to confirm"
+                    className="w-full bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-red-500 transition pr-10"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowDeletePassword(!showDeletePassword)}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-neutral-400 hover:text-white transition p-1"
+                    aria-label={showDeletePassword ? 'Hide password' : 'Show password'}
+                  >
+                    {showDeletePassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-neutral-300">
+                  Type <span className="font-mono text-red-400 font-bold">DELETE</span> to confirm
+                </label>
+                <input
+                  type="text"
+                  value={deleteConfirmText}
+                  onChange={(e) => setDeleteConfirmText(e.target.value)}
+                  required
+                  disabled={isDeletingAccount}
+                  placeholder="DELETE"
+                  className="w-full bg-neutral-900 border border-neutral-800 rounded-xl px-4 py-2.5 text-sm text-white placeholder-neutral-500 focus:outline-none focus:border-red-500 font-mono tracking-wider transition"
+                />
+              </div>
+
+              <div className="flex items-center gap-3 pt-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowDeleteAccountModal(false);
+                    setDeletePassword('');
+                    setDeleteConfirmText('');
+                    setDeleteError(null);
+                  }}
+                  disabled={isDeletingAccount}
+                  className="flex-1 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-neutral-300 font-semibold rounded-xl text-xs transition disabled:opacity-40 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (!deletePassword || deleteConfirmText.trim().toUpperCase() !== 'DELETE') return;
+                    const token = session?.access_token;
+                    if (!token) {
+                      setDeleteError('Authentication session expired. Please sign in again.');
+                      return;
+                    }
+                    setIsDeletingAccount(true);
+                    setDeleteError(null);
+                    try {
+                      await api.deleteAccount(deletePassword, deleteConfirmText, token);
+                      if (typeof window !== 'undefined') {
+                        localStorage.clear();
+                        sessionStorage.clear();
+                      }
+                      await signOut();
+                      showToast('Your account has been permanently deleted.');
+                      if (typeof window !== 'undefined') {
+                        window.location.href = '/';
+                      }
+                    } catch (err: any) {
+                      setDeleteError(err?.message || 'Failed to delete account. Please check your password.');
+                      setIsDeletingAccount(false);
+                    }
+                  }}
+                  disabled={isDeletingAccount || !deletePassword || deleteConfirmText.trim().toUpperCase() !== 'DELETE'}
+                  className="flex-1 py-2.5 bg-red-600 hover:bg-red-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-bold rounded-xl text-xs transition duration-150 shadow-lg shadow-red-600/30 cursor-pointer flex items-center justify-center gap-1.5"
+                >
+                  <Trash2 className="w-3.5 h-3.5" />
+                  {isDeletingAccount ? '⏳ Deleting Account...' : 'Permanently Delete'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

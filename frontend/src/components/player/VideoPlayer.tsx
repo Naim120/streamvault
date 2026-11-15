@@ -1034,7 +1034,7 @@ export const VideoPlayer: React.FC = () => {
     };
   }, [isPlaying, isTrailer, syncProgress]);
 
-  const handleExitPlayer = async () => {
+  const handleExitPlayer = useCallback(async (fromPopState = false) => {
     if (document.fullscreenElement || (document as any).webkitFullscreenElement) {
       try {
         if (document.exitFullscreen) await document.exitFullscreen();
@@ -1059,7 +1059,17 @@ export const VideoPlayer: React.FC = () => {
     queryClient.invalidateQueries({ queryKey: ['watch_history'] });
     triggerProgressRefresh();
     closePlayer();
-  };
+  }, [playbackConfig?.targetId, syncProgress, queryClient, triggerProgressRefresh, closePlayer]);
+
+  useEffect(() => {
+    const handleHardwareBack = () => {
+      handleExitPlayer(true);
+    };
+    window.addEventListener('sv:hardware-back-from-player', handleHardwareBack);
+    return () => {
+      window.removeEventListener('sv:hardware-back-from-player', handleHardwareBack);
+    };
+  }, [handleExitPlayer]);
 
   // Safe Episode Switcher: Prevents timestamp bleed and cross-episode watch_progress pollution
   const handleSwitchToEpisode = async (targetNextEp: Episode) => {
@@ -1681,7 +1691,7 @@ export const VideoPlayer: React.FC = () => {
           <div className="absolute top-0 left-0 right-0 z-40 p-4 sm:p-6 bg-gradient-to-b from-black/95 via-black/60 to-transparent flex items-center justify-between pointer-events-auto">
             <div className="flex items-center gap-4">
               <button
-                onClick={closePlayer}
+                onClick={() => handleExitPlayer()}
                 className="p-2 sm:px-4 sm:py-2 rounded-full bg-black/75 hover:bg-black text-white backdrop-blur-md border border-white/20 transition cursor-pointer flex items-center gap-2 group shadow-xl"
                 title="Back"
               >
@@ -1762,7 +1772,7 @@ export const VideoPlayer: React.FC = () => {
         {/* Top Header Bar */}
         <div className="absolute top-0 left-0 right-0 z-40 p-4 sm:p-6 bg-gradient-to-b from-black/95 via-black/60 to-transparent flex items-center justify-between pointer-events-auto">
           <button
-            onClick={closePlayer}
+            onClick={() => handleExitPlayer()}
             className="p-2 sm:px-4 sm:py-2 rounded-full bg-black/75 hover:bg-black text-white backdrop-blur-md border border-white/20 transition cursor-pointer flex items-center gap-2 group shadow-xl"
             title="Back"
           >
@@ -1796,7 +1806,7 @@ export const VideoPlayer: React.FC = () => {
               </button>
             )}
             <button
-              onClick={closePlayer}
+              onClick={() => handleExitPlayer()}
               className="px-5 py-2.5 bg-neutral-800 hover:bg-neutral-700 text-white font-bold text-xs sm:text-sm rounded-xl transition cursor-pointer border border-neutral-700"
             >
               Back to Title

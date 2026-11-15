@@ -97,12 +97,13 @@ interface UIState {
   setSelectedGenre: (genre: string | null, syncUrl?: boolean) => void;
   openDetail: (media: MediaItem, syncUrl?: boolean) => void;
   closeDetail: (syncUrl?: boolean) => void;
+  closeDetailFromHistory: () => void;
   showToast: (message: string) => void;
   clearToast: () => void;
   resetUI: () => void;
 }
 
-export const useUIStore = create<UIState>((set) => ({
+export const useUIStore = create<UIState>((set, get) => ({
   activeTab: 'home',
   selectedGenre: null,
   detailMedia: null,
@@ -126,10 +127,17 @@ export const useUIStore = create<UIState>((set) => ({
   },
 
   openDetail: (media, syncUrl = true) => {
+    const prevDetail = get().detailMedia;
     set({ detailMedia: media });
-    if (syncUrl) {
-      updateBrowserUrl({ titleId: media.id });
+
+    if (typeof window !== 'undefined') {
+      if (!prevDetail && window.history.state?.svModal !== 'detail' && window.history.state?.svModal !== 'player') {
+        window.history.pushState({ svModal: 'detail', mediaId: media.id }, '', '/home/' + media.id);
+      } else if (syncUrl && (!prevDetail || prevDetail.id !== media.id)) {
+        updateBrowserUrl({ titleId: media.id });
+      }
     }
+
     updatePageSeo({
       title: `Watch ${media.title}${media.release_year ? ` (${media.release_year})` : ''} — StreamVault`,
       description: media.synopsis || undefined,
@@ -140,9 +148,20 @@ export const useUIStore = create<UIState>((set) => ({
 
   closeDetail: (syncUrl = true) => {
     set({ detailMedia: null });
-    if (syncUrl) {
+    if (typeof window !== 'undefined' && window.location.pathname.startsWith('/home/')) {
+      window.history.replaceState({ svModal: 'home' }, '', '/home');
+    } else if (syncUrl) {
       updateBrowserUrl({ titleId: null });
     }
+    updatePageSeo({
+      title: 'Home — StreamVault',
+      canonicalPath: '/home',
+      noIndex: true,
+    });
+  },
+
+  closeDetailFromHistory: () => {
+    set({ detailMedia: null });
     updatePageSeo({
       title: 'Home — StreamVault',
       canonicalPath: '/home',
